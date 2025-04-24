@@ -59,6 +59,7 @@ def main():
     parser.add_argument("--dataset_path", type=str, default=None, help="Path to dataset for RLHF (used in ppo/dpo mode)")
     parser.add_argument("--output_dir", type=str, default=None, help="Directory to save the fine-tuned model (defaults to 'models/ppo_finetuned' for PPO)")
     parser.add_argument("--checkpoint_interval", type=int, default=1, help="Save checkpoints every N epochs (PPO mode only)")
+    parser.add_argument("--hf_token", type=str, default=None, help="Hugging Face API token for accessing gated models")
     args = parser.parse_args()
     
     # Load configuration
@@ -142,7 +143,8 @@ def main():
             config=config,
             reward_predictor=predictor,
             device=device,
-            checkpoint_dir=checkpoint_dir
+            checkpoint_dir=checkpoint_dir,
+            token=args.hf_token
         )
         
         # Load and process SHP dataset using the processors.py

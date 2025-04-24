@@ -32,7 +32,7 @@ wandb:
 
 rlhf:
   ppo:
-    model_name: "meta-llama/Meta-Llama-3.1-Instruct-8B"
+    model_name: "meta-llama/Llama-3.1-8B-Instruct"
     batch_size: 8
     mini_batch_size: 1
     gradient_accumulation_steps: 1
@@ -41,7 +41,7 @@ rlhf:
     kl_penalty: 0.2
   
   dpo:
-    model_name: "meta-llama/Meta-Llama-3.1-Instruct-8B"
+    model_name: "meta-llama/Llama-3.1-8B-Instruct"
     learning_rate: 5e-7
     batch_size: 4
     gradient_accumulation_steps: 1

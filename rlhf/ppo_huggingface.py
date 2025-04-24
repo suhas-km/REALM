@@ -28,7 +28,8 @@ class HuggingFacePPOTrainer:
         tokenizer=None,
         model=None,
         device: Optional[torch.device] = None,
-        checkpoint_dir: Optional[str] = None
+        checkpoint_dir: Optional[str] = None,
+        token: Optional[str] = None
     ):
         self.config = config
         self.reward_predictor = reward_predictor
@@ -45,27 +46,54 @@ class HuggingFacePPOTrainer:
         model_name = config["rlhf"]["ppo"]["model_name"]
         logger.info(f"Loading model and tokenizer: {model_name}")
         
-        # Initialize tokenizer and model if not provided
-        if tokenizer is None:
-            self.tokenizer = AutoTokenizer.from_pretrained(model_name)
-            # Ensure tokenizer has pad token
-            if self.tokenizer.pad_token is None:
-                self.tokenizer.pad_token = self.tokenizer.eos_token
-                self.tokenizer.padding_side = "left"  # Important for PPO training
-        else:
-            self.tokenizer = tokenizer
-            if self.tokenizer.pad_token is None:
-                self.tokenizer.pad_token = self.tokenizer.eos_token
-                self.tokenizer.padding_side = "left"
+        # Prepare authentication token if provided
+        auth_token = token
+        if auth_token is None:
+            # Try to get token from environment
+            auth_token = os.environ.get("HUGGINGFACE_TOKEN", None)
             
-        # Initialize model if not provided
-        if model is None:
-            self.model = AutoModelForCausalLM.from_pretrained(model_name)
+        # Log authentication status
+        if auth_token:
+            logger.info("Using provided Hugging Face authentication token")
         else:
-            self.model = model
+            logger.warning("No Hugging Face token provided - gated models may not be accessible")
+            logger.info("If this fails, consider running 'huggingface-cli login' first")
+        
+        try:
+            # First try loading tokenizer and model with token
+            self.tokenizer = AutoTokenizer.from_pretrained(model_name, token=auth_token)
+            # Set pad_token if not set
+            if self.tokenizer.pad_token is None:
+                self.tokenizer.pad_token = self.tokenizer.eos_token
+            
+            self.model = AutoModelForCausalLM.from_pretrained(model_name, token=auth_token)
+            self.model.to(self.device)
+        except Exception as e:
+            # If loading fails, try different approach
+            logger.warning(f"Failed to load model/tokenizer: {e}")
+            logger.info("Attempting alternative loading method...")
+            
+            try:
+                # Try again with specific options
+                self.tokenizer = AutoTokenizer.from_pretrained(
+                    model_name, 
+                    padding_side="left", 
+                    token=auth_token
+                )
+                if self.tokenizer.pad_token is None:
+                    self.tokenizer.pad_token = self.tokenizer.eos_token
                 
-        # Move model to device
-        self.model.to(self.device)
+                self.model = AutoModelForCausalLM.from_pretrained(
+                    model_name,
+                    torch_dtype=torch.float16 if "cuda" in str(self.device) else torch.float32,
+                    device_map="auto" if "cuda" in str(self.device) else None,
+                    token=auth_token
+                )
+                self.model.to(self.device)
+            except Exception as e2:
+                # If both loading attempts fail, raise error
+                logger.error(f"Failed to load model using alternative method: {e2}")
+                raise ValueError(f"Could not load model {model_name}: {e2}")
         
         # Create PPO config
         self.ppo_config = self._create_ppo_config(config["rlhf"]["ppo"])
