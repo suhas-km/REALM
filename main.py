@@ -1,5 +1,4 @@
 # main.py
-# 
 
 import os
 import argparse
@@ -17,10 +16,10 @@ from utils.embedding_utils import LajavanessEmbedding
 from data.processors import SHPDataProcessor, create_dataloaders
 from inference.predictor import RewardPredictor
 from rlhf.ppo_huggingface import HuggingFacePPOTrainer
-from rlhf.ppo_integration import PPOTrainerWithCustomReward  # Keep for backward compatibility
 from rlhf.dpo_huggingface import HuggingFaceDPOTrainer
-from rlhf.dpo_integration import DPOTrainerWithCustomReward  # Keep for backward compatibility
 from models.qrm_reward import QRMRewardModel
+from data.truthfulness_dataset import TruthfulQADataset, evaluate_model_truthfulness
+from transformers import AutoTokenizer, AutoModelForCausalLM
 
 # Load environment variables
 load_dotenv()
@@ -52,8 +51,12 @@ def main():
     # Parse command-line arguments
     parser = argparse.ArgumentParser(description="Combined Reward Model for RLHF")
     parser.add_argument("--config", type=str, default="config/config.yaml", help="Path to configuration file")
-    parser.add_argument("--mode", type=str, choices=["predict", "ppo", "dpo"], default="predict", help="Operation mode")
-    parser.add_argument("--model_path", type=str, default=None, help="Path to model checkpoint (required for PPO and DPO modes)")
+    parser.add_argument("--mode", type=str, choices=["predict", "ppo", "dpo", "qrm_ppo", "qrm_dpo", "evaluate"], default="predict", help="Operation mode")
+    parser.add_argument("--model_path", type=str, default=None, help="Path to model checkpoint (required for PPO, DPO, and evaluate modes)")
+    parser.add_argument("--model_type", type=str, choices=["ppo", "dpo", "qrm_ppo", "qrm_dpo", "base"], default="base", help="Type of model to evaluate (used in evaluate mode)")
+    parser.add_argument("--max_new_tokens", type=int, default=128, help="Maximum new tokens to generate for evaluation (used in evaluate mode)")
+    parser.add_argument("--batch_size", type=int, default=4, help="Batch size for evaluation (used in evaluate mode)")
+    parser.add_argument("--output_file", type=str, default=None, help="Path to save evaluation results (used in evaluate mode)")
     parser.add_argument("--prompt", type=str, default=None, help="Prompt for prediction (used in predict mode)")
     parser.add_argument("--response", type=str, default=None, help="Response for prediction (used in predict mode)")
     parser.add_argument("--dataset_path", type=str, default=None, help="Path to dataset for RLHF (used in ppo/dpo mode)")
@@ -254,6 +257,223 @@ def main():
         
         # Save the fine-tuned model
         dpo_trainer.save_model(os.path.join("models", "dpo_finetuned"))
+    
+    elif args.mode == "qrm_ppo":
+        # Check if model path is provided
+        if args.model_path is None:
+            raise ValueError("Model path must be provided for QRM-PPO mode")
+        
+        # Set up checkpoint and output directories
+        checkpoint_dir = os.path.join("models", "qrm_ppo_checkpoints", f"run_{time.strftime('%Y%m%d_%H%M%S')}")
+        output_dir = args.output_dir or os.path.join("models", f"qrm_ppo_finetuned_{time.strftime('%Y%m%d_%H%M%S')}")
+        
+        # Log checkpoint configuration
+        logger.info(f"Checkpoints will be saved to: {checkpoint_dir}")
+        logger.info(f"Final model will be saved to: {output_dir}")
+        
+        # Use Hugging Face's PPO Trainer implementation directly with QRM reward model
+        logger.info("Using HuggingFace's PPO implementation with direct QRM reward model")
+        ppo_trainer = HuggingFacePPOTrainer(
+            config=config,
+            reward_predictor=reward_model,  # Use QRM reward model directly
+            device=device,
+            checkpoint_dir=checkpoint_dir,
+            token=args.hf_token
+        )
+        
+        # Load and process SHP dataset using the processors.py
+        logger.info("Loading SHP dataset for QRM-PPO training")
+        data_processor = SHPDataProcessor(config)
+        train_data, val_data, test_data = data_processor.load_dataset()
+        
+        # Check if we have data
+        if train_data is None or len(train_data) == 0:
+            raise ValueError("Failed to load training data for QRM-PPO mode")
+            
+        # Create dataset in format expected by PPO trainer
+        logger.info(f"Preparing dataset with {len(train_data)} examples for QRM-PPO training")
+        
+        # Extract prompts (history field) from SHP dataset
+        prompts = [item["history"] for item in train_data]
+        dataset = {"prompt": prompts}
+        
+        # Train with PPO
+        ppo_trainer.train(
+            dataset=dataset,
+            num_epochs=config["rlhf"]["ppo"].get("num_epochs", 1),
+            max_steps=config["rlhf"]["ppo"].get("max_steps", 100),
+            checkpoint_interval=args.checkpoint_interval
+        )
+        
+        # Save the fine-tuned model
+        logger.info(f"Saving final QRM-PPO fine-tuned model to {output_dir}")
+        ppo_trainer.save_model(output_dir)
+        
+        # Create a symlink to the latest model for convenience
+        latest_link_path = os.path.join("models", "qrm_ppo_finetuned_latest")
+        try:
+            if os.path.exists(latest_link_path) or os.path.islink(latest_link_path):
+                os.remove(latest_link_path)
+            os.symlink(output_dir, latest_link_path, target_is_directory=True)
+            logger.info(f"Created symlink 'qrm_ppo_finetuned_latest' pointing to {output_dir}")
+        except Exception as e:
+            logger.warning(f"Could not create symlink to latest model: {e}")
+    
+    elif args.mode == "qrm_dpo":
+        # Check if model path is provided
+        if args.model_path is None:
+            raise ValueError("Model path must be provided for QRM-DPO mode")
+        
+        # Use Hugging Face's DPO Trainer implementation
+        logger.info("Using HuggingFace's DPO implementation with direct QRM reward model")
+        
+        # Check for PEFT/LoRA flag
+        use_peft = config["rlhf"]["dpo"].get("use_peft", False)
+        
+        dpo_trainer = HuggingFaceDPOTrainer(
+            config=config,
+            reward_predictor=reward_model,  # Use QRM reward model directly
+            device=device,
+            use_peft=use_peft
+        )
+        
+        # Load and process SHP dataset using the processors.py
+        logger.info("Loading SHP dataset for QRM-DPO training")
+        data_processor = SHPDataProcessor(config)
+        train_data, val_data, test_data = data_processor.load_dataset()
+        
+        # Check if we have data
+        if train_data is None or len(train_data) == 0:
+            raise ValueError("Failed to load training data for QRM-DPO mode")
+            
+        # Create dataset in format expected by DPO trainer
+        logger.info(f"Preparing dataset with {len(train_data)} examples for QRM-DPO training")
+        
+        # Extract prompt/chosen/rejected from SHP dataset
+        paired_dataset = []
+        for item in train_data:
+            # Extract data based on the labels field
+            prompt = item["history"]
+            if item["labels"] == 1:  # 1 means human_ref_A is preferred
+                chosen = item["human_ref_A"]
+                rejected = item["human_ref_B"]
+            else:  # 0 means human_ref_B is preferred
+                chosen = item["human_ref_B"]
+                rejected = item["human_ref_A"]
+            
+            paired_dataset.append({
+                "prompt": prompt,
+                "chosen": chosen,
+                "rejected": rejected
+            })
+        
+        # Get num_epochs from config
+        num_epochs = config["rlhf"]["dpo"].get("num_epochs", 3)
+        
+        # Train with DPO on the paired dataset
+        dpo_trainer.train(
+            paired_dataset=paired_dataset,
+            num_epochs=num_epochs,
+            generate_pairs=False  # We already created the pairs
+        )
+        
+        # Save the fine-tuned model
+        output_dir = os.path.join("models", f"qrm_dpo_finetuned_{time.strftime('%Y%m%d_%H%M%S')}")
+        dpo_trainer.save_model(output_dir)
+        
+        # Create a symlink to the latest model for convenience
+        latest_link_path = os.path.join("models", "qrm_dpo_finetuned_latest")
+        try:
+            if os.path.exists(latest_link_path) or os.path.islink(latest_link_path):
+                os.remove(latest_link_path)
+            os.symlink(output_dir, latest_link_path, target_is_directory=True)
+            logger.info(f"Created symlink 'qrm_dpo_finetuned_latest' pointing to {output_dir}")
+        except Exception as e:
+            logger.warning(f"Could not create symlink to latest model: {e}")
+        
+    elif args.mode == "evaluate":
+        # Check if model path is provided
+        if args.model_path is None:
+            raise ValueError("Model path must be provided for evaluate mode")
+        
+        # Create output directory for evaluation results if not specified
+        if args.output_file is None:
+            os.makedirs("evaluation_results", exist_ok=True)
+            timestamp = time.strftime("%Y%m%d_%H%M%S")
+            args.output_file = os.path.join("evaluation_results", f"{args.model_type}_evaluation_{timestamp}.json")
+        
+        # Ensure the output directory exists
+        os.makedirs(os.path.dirname(args.output_file), exist_ok=True)
+        
+        logger.info(f"Evaluating model: {args.model_path}")
+        logger.info(f"Model type: {args.model_type}")
+        logger.info(f"Results will be saved to: {args.output_file}")
+        
+        # Load model and tokenizer
+        try:
+            logger.info(f"Loading model and tokenizer from: {args.model_path}")
+            model = AutoModelForCausalLM.from_pretrained(
+                args.model_path,
+                device_map="auto" if "cuda" in str(device) else None,
+                torch_dtype=torch.float16 if "cuda" in str(device) else torch.float32
+            )
+            tokenizer = AutoTokenizer.from_pretrained(args.model_path)
+            
+            # Set pad token if not set
+            if tokenizer.pad_token is None:
+                tokenizer.pad_token = tokenizer.eos_token
+                
+            logger.info(f"Model and tokenizer loaded successfully")
+        except Exception as e:
+            logger.error(f"Failed to load model or tokenizer: {str(e)}")
+            raise
+        
+        # Load TruthfulQA dataset
+        logger.info("Loading TruthfulQA dataset")
+        try:
+            truthful_dataset = TruthfulQADataset()
+            eval_data = truthful_dataset.load_dataset()
+            logger.info(f"Loaded {len(eval_data)} TruthfulQA questions for evaluation")
+        except Exception as e:
+            logger.error(f"Failed to load TruthfulQA dataset: {str(e)}")
+            raise
+        
+        # Evaluate model on TruthfulQA
+        try:
+            logger.info("Starting evaluation on TruthfulQA dataset")
+            results = evaluate_model_truthfulness(
+                model=model,
+                tokenizer=tokenizer,
+                eval_data=eval_data,
+                max_new_tokens=args.max_new_tokens,
+                batch_size=args.batch_size,
+                device=device
+            )
+            
+            # Log summary of results
+            accuracy = results["metrics"]["accuracy"]
+            correct_count = results["metrics"]["correct_count"]
+            total_count = results["metrics"]["total_count"]
+            logger.info(f"Evaluation completed - Accuracy: {accuracy:.4f} ({correct_count}/{total_count})")
+            
+            # Save results to file
+            import json
+            with open(args.output_file, "w") as f:
+                # Add metadata to results
+                results["metadata"] = {
+                    "model_path": args.model_path,
+                    "model_type": args.model_type,
+                    "max_new_tokens": args.max_new_tokens,
+                    "batch_size": args.batch_size,
+                    "evaluation_time": time.strftime("%Y-%m-%d %H:%M:%S")
+                }
+                json.dump(results, f, indent=2)
+                
+            logger.info(f"Evaluation results saved to {args.output_file}")
+            
+        except Exception as e:
+            logger.error(f"Error during evaluation: {str(e)}")
+            raise
         
     else:
         raise ValueError(f"Invalid mode: {args.mode}")

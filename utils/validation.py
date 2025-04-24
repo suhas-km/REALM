@@ -13,14 +13,12 @@ def validate_environment():
     No API keys are required since we're using the Hugging Face QRM-Llama3.1-8B-v2 model.
     """
     checks = []
-    
-    # No API keys needed since we're using the Hugging Face QRM-Llama3.1-8B-v2 model
-    # Previously we checked for NVIDIA_NIM_API_KEY here
+
     
     # Check required packages
     required_packages = {
         "torch": "torch",
-        "transformers": "transformers",  # Added for Hugging Face models
+        "transformers": "transformers",
         "datasets": "datasets",
         "fastapi": "fastapi",
         "trl": "trl"
