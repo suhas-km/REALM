@@ -1,34 +1,43 @@
-# combination of linear reward model and Lajavaness embedding
+# combination of harmonic mean function and Lajavaness embedding
 # inference/predictor.py
-# this script is only used after we combine the linear reward model with the Lajavaness embedding
 import torch
 import logging
-from typing import Optional
+from typing import Optional, Tuple
 import numpy as np
 
-from models.linear_reward_model import LinearRewardModel
 from models.nim_reward import NIMRewardModel
 from utils.embedding_utils import LajavanessEmbedding, cosine_similarity
 
 logger = logging.getLogger(__name__)
 
+def harmonic_blend(sim: float, reward: float, alpha: float = 0.5) -> float:
+    """
+    Calculate harmonic mean between similarity and reward scores
+    
+    Args:
+        sim: Similarity score between prompt and response
+        reward: Reward model score
+        alpha: Weight parameter (default: 0.5 for equal weighting)
+        
+    Returns:
+        Harmonic mean of the two scores
+    """
+    epsilon = 1e-8  # Small value to prevent division by zero
+    return 2 * (alpha * sim * (1 - alpha) * reward) / (alpha * sim + (1 - alpha) * reward + epsilon)
+
 class RewardPredictor:
-    """Predictor class for combined reward model inference"""
+    """Predictor class for harmonic blend reward model inference"""
     
     def __init__(
         self,
-        model_path: str,
         nim_reward_model: NIMRewardModel,
         embedding_model: LajavanessEmbedding,
         device: Optional[torch.device] = None,
-        cache_size: int = 1000
+        cache_size: int = 1000,
+        alpha: float = 0.5
     ):
         # Set device
         self.device = device if device is not None else torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        
-        # Load model
-        self.model = LinearRewardModel.load(model_path, device=self.device)
-        self.model.eval()
         
         # Models for feature extraction
         self.nim_reward_model = nim_reward_model
@@ -39,7 +48,10 @@ class RewardPredictor:
         self.embedding_cache = {}
         self.cache_size = cache_size
         
-        logger.info(f"Reward predictor initialized with model from {model_path}")
+        # Alpha parameter for harmonic blend
+        self.alpha = alpha
+        
+        logger.info(f"Reward predictor initialized with harmonic blend (alpha={self.alpha})")
     
     def _get_llama_score(self, prompt: str, response: str) -> float:
         """Get Llama reward score with caching"""
@@ -85,11 +97,32 @@ class RewardPredictor:
         # Calculate similarity score
         similarity = cosine_similarity(prompt_embedding, response_embedding)
         
-        # Create feature tensor
-        features = torch.tensor([llama_score, similarity], dtype=torch.float32).to(self.device)
+        # Apply harmonic blend instead of linear model
+        reward = harmonic_blend(similarity, llama_score, self.alpha)
         
-        # Get model prediction
-        with torch.no_grad():
-            reward = self.model(features.unsqueeze(0))
+        return reward
+    
+    def compare(self, prompt: str, response1: str, response2: str) -> Tuple[float, float, int]:
+        """
+        Compare two responses and return their rewards and which is better
         
-        return reward.item()
+        Args:
+            prompt: The prompt text
+            response1: First response
+            response2: Second response
+            
+        Returns:
+            Tuple of (reward1, reward2, better) where better is 1 if response1 is better, 
+            2 if response2 is better, and 0 if they're equal
+        """
+        reward1 = self.predict(prompt, response1)
+        reward2 = self.predict(prompt, response2)
+        
+        if reward1 > reward2:
+            better = 1
+        elif reward2 > reward1:
+            better = 2
+        else:
+            better = 0
+            
+        return reward1, reward2, better
