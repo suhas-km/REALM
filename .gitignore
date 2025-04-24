@@ -1,0 +1,6 @@
+# Ignore all files in the current directory
+
+
+# Ignore all files in subdirectories
+
+*.DS_Store

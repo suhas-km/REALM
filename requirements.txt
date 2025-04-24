@@ -1,0 +1,20 @@
+# requirements.txt
+torch
+transformers
+accelerate
+google-genai 
+datasets
+peft
+trl
+wandb
+pandas
+numpy
+scikit-learn
+pydantic
+tqdm
+python-dotenv
+fastapi
+uvicorn
+requests
+openai
+sentence-transformers
