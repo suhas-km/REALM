@@ -5,7 +5,7 @@ import logging
 from typing import Optional, Tuple
 import numpy as np
 
-from models.nim_reward import NIMRewardModel
+from models.qrm_reward import QRMRewardModel
 from utils.embedding_utils import LajavanessEmbedding, cosine_similarity
 
 logger = logging.getLogger(__name__)
@@ -30,17 +30,18 @@ class RewardPredictor:
     
     def __init__(
         self,
-        nim_reward_model: NIMRewardModel,
+        reward_model: QRMRewardModel,
         embedding_model: LajavanessEmbedding,
         device: Optional[torch.device] = None,
         cache_size: int = 1000,
-        alpha: float = 0.5
+        alpha: float = 0.5,
+        model_path: Optional[str] = None  # Kept for backward compatibility but not used
     ):
         # Set device
         self.device = device if device is not None else torch.device("cuda" if torch.cuda.is_available() else "cpu")
         
         # Models for feature extraction
-        self.nim_reward_model = nim_reward_model
+        self.reward_model = reward_model
         self.embedding_model = embedding_model
         
         # Cache for scores and embeddings
@@ -59,7 +60,7 @@ class RewardPredictor:
         if cache_key in self.llama_score_cache:
             return self.llama_score_cache[cache_key]
         
-        score = self.nim_reward_model.get_reward_score(prompt, response)
+        score = self.reward_model.get_reward_score(prompt, response)
         
         # Cache the result
         if len(self.llama_score_cache) >= self.cache_size:

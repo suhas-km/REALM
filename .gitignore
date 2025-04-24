@@ -4,3 +4,24 @@
 # Ignore all files in subdirectories
 
 *.DS_Store
+
+#pytorch models
+*.pt
+
+#wandb
+wandb/
+
+#cache
+cache/
+
+#logs
+logs/
+
+#venv
+.venv/
+
+#realmVenv
+realmVenv/
+
+#pyc
+*.pyc

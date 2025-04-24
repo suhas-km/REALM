@@ -8,6 +8,7 @@ from datasets import Dataset
 from tqdm import tqdm
 
 # Import specific components for TRL 0.16.1
+import time
 from trl import PPOConfig, PPOTrainer
 
 from inference.predictor import RewardPredictor
@@ -26,13 +27,19 @@ class HuggingFacePPOTrainer:
         reward_predictor: RewardPredictor,
         tokenizer=None,
         model=None,
-        device: Optional[torch.device] = None
+        device: Optional[torch.device] = None,
+        checkpoint_dir: Optional[str] = None
     ):
         self.config = config
         self.reward_predictor = reward_predictor
         
         # Set device
         self.device = device if device is not None else torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        
+        # Set checkpoint directory
+        self.checkpoint_dir = checkpoint_dir or os.path.join("models", "ppo_checkpoints")
+        os.makedirs(self.checkpoint_dir, exist_ok=True)
+        logger.info(f"Checkpoints will be saved to: {self.checkpoint_dir}")
         
         # Model initialization
         model_name = config["rlhf"]["ppo"]["model_name"]
@@ -103,7 +110,7 @@ class HuggingFacePPOTrainer:
             rewards.append(float(reward))
         return rewards
         
-    def train(self, dataset: Dict, num_epochs: int = 1, max_steps: int = 100):
+    def train(self, dataset: Dict, num_epochs: int = 1, max_steps: int = 100, checkpoint_interval: int = 1):
         """Train the model using TRL 0.16.1's PPO implementation"""
         logger.info(f"Starting PPO training with HuggingFace TRL 0.16.1 for {num_epochs} epochs, max {max_steps} steps")
         
@@ -216,6 +223,16 @@ class HuggingFacePPOTrainer:
             if epoch_rewards:
                 avg_reward = sum(epoch_rewards) / len(epoch_rewards)
                 logger.info(f"Epoch {epoch+1} average reward: {avg_reward:.4f}")
+                
+                # Save checkpoint at specified intervals
+                if (epoch + 1) % checkpoint_interval == 0:
+                    checkpoint_path = os.path.join(self.checkpoint_dir, f"checkpoint-epoch-{epoch+1}")
+                    self.save_checkpoint(checkpoint_path, metadata={
+                        "epoch": epoch + 1,
+                        "avg_reward": avg_reward,
+                        "timestamp": time.strftime("%Y-%m-%d-%H-%M-%S")
+                    })
+                    logger.info(f"Saved checkpoint for epoch {epoch+1} to {checkpoint_path}")
         
         logger.info("HuggingFace PPO training completed")
         
@@ -224,12 +241,42 @@ class HuggingFacePPOTrainer:
             self.model = ppo_trainer.model
         return self.model
     
+    def save_checkpoint(self, checkpoint_path: str, metadata: Dict = None):
+        """Save a checkpoint during training with metadata"""
+        os.makedirs(checkpoint_path, exist_ok=True)
+        
+        # Save the model and tokenizer
+        self.model.save_pretrained(checkpoint_path)
+        self.tokenizer.save_pretrained(checkpoint_path)
+        
+        # Save metadata if provided
+        if metadata:
+            import json
+            with open(os.path.join(checkpoint_path, "checkpoint_metadata.json"), "w") as f:
+                json.dump(metadata, f, indent=2)
+        
+        logger.info(f"Checkpoint saved to {checkpoint_path}")
+    
     def save_model(self, output_dir: str):
-        """Save the fine-tuned model"""
+        """Save the final fine-tuned model"""
         os.makedirs(output_dir, exist_ok=True)
         
         # Directly save the model and tokenizer
         self.model.save_pretrained(output_dir)
         self.tokenizer.save_pretrained(output_dir)
         
-        logger.info(f"Model and tokenizer saved to {output_dir}")
+        # Save training configuration
+        import json
+        config_path = os.path.join(output_dir, "training_config.json")
+        with open(config_path, "w") as f:
+            # Extract relevant PPO config for saving
+            ppo_config = {
+                "learning_rate": self.ppo_config.learning_rate,
+                "batch_size": self.ppo_config.batch_size,
+                "mini_batch_size": self.ppo_config.mini_batch_size,
+                "model_name": self.model.config.name_or_path if hasattr(self.model.config, "name_or_path") else "custom",
+                "saved_at": time.strftime("%Y-%m-%d %H:%M:%S")
+            }
+            json.dump(ppo_config, f, indent=2)
+        
+        logger.info(f"Model, tokenizer, and config saved to {output_dir}")

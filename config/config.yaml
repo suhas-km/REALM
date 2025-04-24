@@ -1,0 +1,48 @@
+# config/config.yaml
+qrm_reward:
+  model_id: "nicolinho/QRM-Llama3.1-8B-v2"
+
+embedding:
+  model_id: "Lajavaness/bilingual-embedding-large"
+
+data:
+  dataset_name: "stanfordnlp/SHP"
+  preprocessing:
+    max_length: 1024
+    batch_size: 16
+    num_workers: 0
+    cache_dir: "./cache"
+
+# We're using harmonic blend method instead of a neural network model
+reward:
+  method: "harmonic_blend"
+  alpha: 0.5  # Weight parameter for harmonic blend (0.5 = equal weighting)
+
+# General settings (we're not training a neural network model)
+general:
+  seed: 42
+  use_wandb: false
+
+# Wandb configuration (optional, can be disabled)
+wandb:
+  project: "qrm-harmonic-reward-model"
+  entity: "your-wandb-entity"
+  name: "harmonic-blend-reward-model"
+  enabled: false
+
+rlhf:
+  ppo:
+    model_name: "meta-llama/Meta-Llama-3.1-Instruct-8B"
+    batch_size: 8
+    mini_batch_size: 1
+    gradient_accumulation_steps: 1
+    learning_rate: 1.41e-5
+    max_length: 512
+    kl_penalty: 0.2
+  
+  dpo:
+    model_name: "meta-llama/Meta-Llama-3.1-Instruct-8B"
+    learning_rate: 5e-7
+    batch_size: 4
+    gradient_accumulation_steps: 1
+    beta: 0.1

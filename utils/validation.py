@@ -6,23 +6,21 @@ import torch
 
 logger = logging.getLogger(__name__)
 
-def validate_environment(skip_api_check=False):
+def validate_environment():
     """Validate environment and dependencies before running
     
-    Args:
-        skip_api_check: If True, skips checking for API keys (useful for test mode)
+    Checks for required Python packages, CUDA availability, and cache directory permissions.
+    No API keys are required since we're using the Hugging Face QRM-Llama3.1-8B-v2 model.
     """
     checks = []
     
-    # Check API keys (optional)
-    if not skip_api_check and not os.environ.get("NVIDIA_NIM_API_KEY"):
-        checks.append("NVIDIA_NIM_API_KEY is not set in environment")
+    # No API keys needed since we're using the Hugging Face QRM-Llama3.1-8B-v2 model
+    # Previously we checked for NVIDIA_NIM_API_KEY here
     
     # Check required packages
     required_packages = {
-        "openai": "openai",
-        "google.genai": "google-genai",
         "torch": "torch",
+        "transformers": "transformers",  # Added for Hugging Face models
         "datasets": "datasets",
         "fastapi": "fastapi",
         "trl": "trl"

@@ -9,8 +9,8 @@ from typing import Dict, Tuple, Optional, Any
 from datasets import load_dataset
 from torch.utils.data import Dataset, DataLoader
 
-# Updated import for the NIM reward model
-from models.nim_reward import NIMRewardModel
+# Updated import for the QRM reward model
+from models.qrm_reward import QRMRewardModel
 from utils.embedding_utils import LajavanessEmbedding, cosine_similarity
 
 logger = logging.getLogger(__name__)
@@ -94,7 +94,7 @@ class SHPRewardDataset(Dataset):
     def __init__(
         self, 
         data,
-        nim_reward_model: NIMRewardModel,
+        reward_model: QRMRewardModel,
         embedding_model: LajavanessEmbedding,
         cache_dir: str,
         max_length: int = 1024,
@@ -102,7 +102,7 @@ class SHPRewardDataset(Dataset):
         cache_embeddings: bool = True
     ):
         self.data = data
-        self.nim_reward_model = nim_reward_model
+        self.reward_model = reward_model
         self.embedding_model = embedding_model
         self.cache_dir = cache_dir
         self.max_length = max_length
@@ -201,14 +201,14 @@ class SHPRewardDataset(Dataset):
         
         for attempt in range(max_retries):
             try:
-                score = self.nim_reward_model.get_reward_score(prompt, response)
+                reward = self.reward_model.get_reward_score(prompt, response)
                 
                 # Cache the score in memory (with limited size)
                 if len(self.reward_cache) > 1000:  # Limit cache size
                     self.reward_cache.pop(next(iter(self.reward_cache)))
-                self.reward_cache[cache_key] = score
+                self.reward_cache[cache_key] = reward
                 
-                return score
+                return reward
                 
             except Exception as e:
                 logger.warning(f"Reward score attempt {attempt+1} failed: {str(e)}")
@@ -314,7 +314,7 @@ def create_dataloaders(
     train_data,
     val_data,
     test_data,
-    nim_reward_model: NIMRewardModel,
+    reward_model: QRMRewardModel,
     embedding_model: LajavanessEmbedding
 ) -> Tuple[Optional[DataLoader], Optional[DataLoader], Optional[DataLoader]]:
     """Create dataloaders for training, validation, and testing"""
@@ -329,7 +329,7 @@ def create_dataloaders(
     if train_data is not None:
         logger.info("Creating training dataset...")
         train_dataset = SHPRewardDataset(
-            train_data, nim_reward_model, embedding_model, 
+            train_data, reward_model, embedding_model, 
             os.path.join(cache_dir, "train"),
             max_length
         )
@@ -346,7 +346,7 @@ def create_dataloaders(
     if val_data is not None:
         logger.info("Creating validation dataset...")
         val_dataset = SHPRewardDataset(
-            val_data, nim_reward_model, embedding_model, 
+            val_data, reward_model, embedding_model, 
             os.path.join(cache_dir, "validation"),
             max_length
         )
@@ -363,7 +363,7 @@ def create_dataloaders(
     if test_data is not None:
         logger.info("Creating test dataset...")
         test_dataset = SHPRewardDataset(
-            test_data, nim_reward_model, embedding_model, 
+            test_data, reward_model, embedding_model, 
             os.path.join(cache_dir, "test"),
             max_length
         )
@@ -379,7 +379,7 @@ def create_dataloaders(
     
     return train_dataloader, val_dataloader, test_dataloader
 
-def safe_initialize_dataset(config, nim_reward_model, embedding_model):
+def safe_initialize_dataset(config, reward_model, embedding_model):
     """
     Progressive initialization to avoid rate limiting and verify functionality
     """
@@ -405,7 +405,7 @@ def safe_initialize_dataset(config, nim_reward_model, embedding_model):
     
     test_dataset = SHPRewardDataset(
         test_subset, 
-        nim_reward_model, 
+        reward_model, 
         embedding_model,
         test_cache_dir,
         config["data"]["preprocessing"]["max_length"]
