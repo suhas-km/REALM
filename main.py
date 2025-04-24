@@ -52,7 +52,7 @@ def main():
     parser = argparse.ArgumentParser(description="Combined Reward Model for RLHF")
     parser.add_argument("--config", type=str, default="config/config.yaml", help="Path to configuration file")
     parser.add_argument("--mode", type=str, choices=["predict", "ppo", "dpo", "qrm_ppo", "qrm_dpo", "evaluate"], default="predict", help="Operation mode")
-    parser.add_argument("--model_path", type=str, default=None, help="Path to model checkpoint (required for PPO, DPO, and evaluate modes)")
+    parser.add_argument("--model_path", type=str, default=None, help="Path to model checkpoint (overrides config.yaml model_name, required for evaluate mode)")
     parser.add_argument("--model_type", type=str, choices=["ppo", "dpo", "qrm_ppo", "qrm_dpo", "base"], default="base", help="Type of model to evaluate (used in evaluate mode)")
     parser.add_argument("--max_new_tokens", type=int, default=128, help="Maximum new tokens to generate for evaluation (used in evaluate mode)")
     parser.add_argument("--batch_size", type=int, default=4, help="Batch size for evaluation (used in evaluate mode)")
@@ -119,10 +119,6 @@ def main():
         logger.info(f"Predicted reward: {reward}")
         
     elif args.mode == "ppo":
-        # Check if model path is provided
-        if args.model_path is None:
-            raise ValueError("Model path must be provided for PPO mode")
-        
         # Initialize predictor with alpha from config
         alpha = config["reward"]["alpha"]
         predictor = RewardPredictor(
@@ -140,6 +136,15 @@ def main():
         logger.info(f"Checkpoints will be saved to: {checkpoint_dir}")
         logger.info(f"Final model will be saved to: {output_dir}")
         
+        # If model_path is provided, override the one in config
+        if args.model_path:
+            # Override config with command line argument
+            config["rlhf"]["ppo"]["model_name"] = args.model_path
+            logger.info(f"Using model path from command line: {args.model_path}")
+        else:
+            # Use the one from config
+            logger.info(f"Using model path from config: {config['rlhf']['ppo']['model_name']}")
+            
         # Use Hugging Face's PPO Trainer implementation
         logger.info("Using HuggingFace's PPO implementation")
         ppo_trainer = HuggingFacePPOTrainer(
@@ -189,10 +194,6 @@ def main():
             logger.warning(f"Could not create symlink to latest model: {e}")
         
     elif args.mode == "dpo":
-        # Check if model path is provided
-        if args.model_path is None:
-            raise ValueError("Model path must be provided for DPO mode")
-        
         # Initialize predictor with alpha from config
         alpha = config["reward"]["alpha"]
         predictor = RewardPredictor(
@@ -201,6 +202,15 @@ def main():
             device=device,
             alpha=alpha
         )
+        
+        # If model_path is provided, override the one in config
+        if args.model_path:
+            # Override config with command line argument
+            config["rlhf"]["dpo"]["model_name"] = args.model_path
+            logger.info(f"Using model path from command line: {args.model_path}")
+        else:
+            # Use the one from config
+            logger.info(f"Using model path from config: {config['rlhf']['dpo']['model_name']}")
         
         # Use Hugging Face's DPO Trainer implementation
         logger.info("Using HuggingFace's DPO implementation")
@@ -259,10 +269,6 @@ def main():
         dpo_trainer.save_model(os.path.join("models", "dpo_finetuned"))
     
     elif args.mode == "qrm_ppo":
-        # Check if model path is provided
-        if args.model_path is None:
-            raise ValueError("Model path must be provided for QRM-PPO mode")
-        
         # Set up checkpoint and output directories
         checkpoint_dir = os.path.join("models", "qrm_ppo_checkpoints", f"run_{time.strftime('%Y%m%d_%H%M%S')}")
         output_dir = args.output_dir or os.path.join("models", f"qrm_ppo_finetuned_{time.strftime('%Y%m%d_%H%M%S')}")
@@ -270,6 +276,15 @@ def main():
         # Log checkpoint configuration
         logger.info(f"Checkpoints will be saved to: {checkpoint_dir}")
         logger.info(f"Final model will be saved to: {output_dir}")
+        
+        # If model_path is provided, override the one in config
+        if args.model_path:
+            # Override config with command line argument
+            config["rlhf"]["ppo"]["model_name"] = args.model_path
+            logger.info(f"Using model path from command line: {args.model_path}")
+        else:
+            # Use the one from config
+            logger.info(f"Using model path from config: {config['rlhf']['ppo']['model_name']}")
         
         # Use Hugging Face's PPO Trainer implementation directly with QRM reward model
         logger.info("Using HuggingFace's PPO implementation with direct QRM reward model")
@@ -320,9 +335,14 @@ def main():
             logger.warning(f"Could not create symlink to latest model: {e}")
     
     elif args.mode == "qrm_dpo":
-        # Check if model path is provided
-        if args.model_path is None:
-            raise ValueError("Model path must be provided for QRM-DPO mode")
+        # If model_path is provided, override the one in config
+        if args.model_path:
+            # Override config with command line argument
+            config["rlhf"]["dpo"]["model_name"] = args.model_path
+            logger.info(f"Using model path from command line: {args.model_path}")
+        else:
+            # Use the one from config
+            logger.info(f"Using model path from config: {config['rlhf']['dpo']['model_name']}")
         
         # Use Hugging Face's DPO Trainer implementation
         logger.info("Using HuggingFace's DPO implementation with direct QRM reward model")

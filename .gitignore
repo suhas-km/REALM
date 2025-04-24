@@ -25,3 +25,9 @@ realmVenv/
 
 #pyc
 *.pyc
+
+#pdm-build
+/.pdm-build
+
+#uv 
+/uv.lock
