@@ -52,18 +52,21 @@ class HuggingFacePPOTrainer:
         # Log authentication status
         if auth_token:
             logger.info("Using Hugging Face authentication token from environment")
+            # Set the token in the Hugging Face hub library
+            import huggingface_hub
+            huggingface_hub.login(token=auth_token, add_to_git_credential=False)
         else:
             logger.warning("No Hugging Face token found in environment - gated models may not be accessible")
             logger.info("Consider running 'huggingface-cli login' or setting HUGGINGFACE_TOKEN environment variable")
         
         try:
             # First try loading tokenizer and model with token
-            self.tokenizer = AutoTokenizer.from_pretrained(model_name, token=auth_token)
+            self.tokenizer = AutoTokenizer.from_pretrained(model_name, token=auth_token, use_auth_token=auth_token)
             # Set pad_token if not set
             if self.tokenizer.pad_token is None:
                 self.tokenizer.pad_token = self.tokenizer.eos_token
             
-            self.model = AutoModelForCausalLM.from_pretrained(model_name, token=auth_token)
+            self.model = AutoModelForCausalLM.from_pretrained(model_name, token=auth_token, use_auth_token=auth_token)
             self.model.to(self.device)
         except Exception as e:
             # If loading fails, try different approach
@@ -75,7 +78,8 @@ class HuggingFacePPOTrainer:
                 self.tokenizer = AutoTokenizer.from_pretrained(
                     model_name, 
                     padding_side="left", 
-                    token=auth_token
+                    token=auth_token,
+                    use_auth_token=auth_token
                 )
                 if self.tokenizer.pad_token is None:
                     self.tokenizer.pad_token = self.tokenizer.eos_token
@@ -84,7 +88,8 @@ class HuggingFacePPOTrainer:
                     model_name,
                     torch_dtype=torch.float16 if "cuda" in str(self.device) else torch.float32,
                     device_map="auto" if "cuda" in str(self.device) else None,
-                    token=auth_token
+                    token=auth_token,
+                    use_auth_token=auth_token
                 )
                 self.model.to(self.device)
             except Exception as e2:
@@ -183,6 +188,7 @@ class HuggingFacePPOTrainer:
             torch_dtype=torch.float16 if "cuda" in str(self.device) else torch.float32,
             device_map="auto" if "cuda" in str(self.device) else None,
             token=auth_token,
+            use_auth_token=auth_token,
             state_dict=self.model.state_dict(),  # Transfer existing weights
         )
         ppo_model.to(self.device)
