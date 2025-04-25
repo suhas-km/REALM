@@ -39,6 +39,8 @@ rlhf:
     learning_rate: 1.41e-5
     max_length: 512
     kl_penalty: 0.2
+    max_steps: 0  # Use 0 to process the full dataset
+    num_epochs: 1
   
   dpo:
     model_name: "meta-llama/Llama-3.1-8B-Instruct"

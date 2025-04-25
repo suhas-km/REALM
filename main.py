@@ -168,8 +168,37 @@ def main():
         logger.info(f"Preparing dataset with {len(train_data)} examples for PPO training")
         
         # Extract prompts (history field) from SHP dataset
-        prompts = [item["history"] for item in train_data]
-        dataset = {"prompt": prompts}
+        try:
+            # Try accessing as dictionary with expected SHP fields
+            logger.info("Attempting to extract prompts using standard SHP format")
+            prompts = []
+            for item in train_data:
+                if isinstance(item, dict) and "history" in item:
+                    prompts.append(item["history"])
+                elif isinstance(item, str):
+                    # If item is already a string, use it directly
+                    prompts.append(item)
+                else:
+                    # Try to get the first field in the dictionary
+                    if isinstance(item, dict) and len(item) > 0:
+                        first_key = next(iter(item))
+                        prompts.append(item[first_key])
+                    else:
+                        logger.warning(f"Could not extract prompt from item: {item}")
+                        prompts.append("")
+            
+            logger.info(f"Successfully extracted {len(prompts)} prompts")
+            dataset = {"prompt": prompts}
+            
+        except Exception as e:
+            logger.error(f"Error extracting prompts: {e}")
+            logger.info("Falling back to using the entire dataset as prompts")
+            
+            # As a fallback, if train_data is already a list of strings, use it directly
+            if all(isinstance(item, str) for item in train_data):
+                dataset = {"prompt": train_data}
+            else:
+                raise ValueError(f"Dataset format not supported: {type(train_data)}")
         
         # Train with PPO
         ppo_trainer.train(
@@ -238,22 +267,53 @@ def main():
         logger.info(f"Preparing dataset with {len(train_data)} examples for DPO training")
         
         # Extract prompt/chosen/rejected from SHP dataset
-        paired_dataset = []
-        for item in train_data:
-            # Extract data based on the labels field
-            prompt = item["history"]
-            if item["labels"] == 1:  # 1 means human_ref_A is preferred
-                chosen = item["human_ref_A"]
-                rejected = item["human_ref_B"]
-            else:  # 0 means human_ref_B is preferred
-                chosen = item["human_ref_B"]
-                rejected = item["human_ref_A"]
+        try:
+            # Try accessing as dictionary with expected SHP fields
+            logger.info("Attempting to extract prompts and responses using standard SHP format")
+            paired_dataset = []
             
-            paired_dataset.append({
-                "prompt": prompt,
-                "chosen": chosen,
-                "rejected": rejected
-            })
+            for item in train_data:
+                if isinstance(item, dict) and "history" in item and "human_ref_A" in item and "human_ref_B" in item and "labels" in item:
+                    # Extract data based on the labels field
+                    prompt = item["history"]
+                    if item["labels"] == 1:  # 1 means human_ref_A is preferred
+                        chosen = item["human_ref_A"]
+                        rejected = item["human_ref_B"]
+                    else:  # 0 means human_ref_B is preferred
+                        chosen = item["human_ref_B"]
+                        rejected = item["human_ref_A"]
+                    
+                    paired_dataset.append({
+                        "prompt": prompt,
+                        "chosen": chosen,
+                        "rejected": rejected
+                    })
+                elif isinstance(item, dict) and len(item) >= 3:
+                    # Try to extract from generic dictionary with at least 3 fields
+                    keys = list(item.keys())
+                    if len(keys) >= 3:
+                        prompt_key = keys[0]
+                        chosen_key = keys[1]
+                        rejected_key = keys[2]
+                        
+                        paired_dataset.append({
+                            "prompt": item[prompt_key],
+                            "chosen": item[chosen_key],
+                            "rejected": item[rejected_key]
+                        })
+                else:
+                    logger.warning(f"Could not process item format: {type(item)}")
+            
+            if not paired_dataset:
+                raise ValueError("Failed to extract paired dataset using standard format")
+                
+            logger.info(f"Successfully extracted {len(paired_dataset)} paired examples")
+            
+        except Exception as e:
+            logger.error(f"Error extracting paired dataset: {e}")
+            logger.warning("Dataset format not compatible with DPO format requirements")
+            paired_dataset = []
+            raise ValueError("Could not create paired dataset from the provided data format")
         
         # Get num_epochs from config
         num_epochs = config["rlhf"]["dpo"].get("num_epochs", 3)
@@ -309,8 +369,37 @@ def main():
         logger.info(f"Preparing dataset with {len(train_data)} examples for QRM-PPO training")
         
         # Extract prompts (history field) from SHP dataset
-        prompts = [item["history"] for item in train_data]
-        dataset = {"prompt": prompts}
+        try:
+            # Try accessing as dictionary with expected SHP fields
+            logger.info("Attempting to extract prompts using standard SHP format")
+            prompts = []
+            for item in train_data:
+                if isinstance(item, dict) and "history" in item:
+                    prompts.append(item["history"])
+                elif isinstance(item, str):
+                    # If item is already a string, use it directly
+                    prompts.append(item)
+                else:
+                    # Try to get the first field in the dictionary
+                    if isinstance(item, dict) and len(item) > 0:
+                        first_key = next(iter(item))
+                        prompts.append(item[first_key])
+                    else:
+                        logger.warning(f"Could not extract prompt from item: {item}")
+                        prompts.append("")
+            
+            logger.info(f"Successfully extracted {len(prompts)} prompts")
+            dataset = {"prompt": prompts}
+            
+        except Exception as e:
+            logger.error(f"Error extracting prompts: {e}")
+            logger.info("Falling back to using the entire dataset as prompts")
+            
+            # As a fallback, if train_data is already a list of strings, use it directly
+            if all(isinstance(item, str) for item in train_data):
+                dataset = {"prompt": train_data}
+            else:
+                raise ValueError(f"Dataset format not supported: {type(train_data)}")
         
         # Train with PPO
         ppo_trainer.train(
@@ -370,22 +459,53 @@ def main():
         logger.info(f"Preparing dataset with {len(train_data)} examples for QRM-DPO training")
         
         # Extract prompt/chosen/rejected from SHP dataset
-        paired_dataset = []
-        for item in train_data:
-            # Extract data based on the labels field
-            prompt = item["history"]
-            if item["labels"] == 1:  # 1 means human_ref_A is preferred
-                chosen = item["human_ref_A"]
-                rejected = item["human_ref_B"]
-            else:  # 0 means human_ref_B is preferred
-                chosen = item["human_ref_B"]
-                rejected = item["human_ref_A"]
+        try:
+            # Try accessing as dictionary with expected SHP fields
+            logger.info("Attempting to extract prompts and responses using standard SHP format")
+            paired_dataset = []
             
-            paired_dataset.append({
-                "prompt": prompt,
-                "chosen": chosen,
-                "rejected": rejected
-            })
+            for item in train_data:
+                if isinstance(item, dict) and "history" in item and "human_ref_A" in item and "human_ref_B" in item and "labels" in item:
+                    # Extract data based on the labels field
+                    prompt = item["history"]
+                    if item["labels"] == 1:  # 1 means human_ref_A is preferred
+                        chosen = item["human_ref_A"]
+                        rejected = item["human_ref_B"]
+                    else:  # 0 means human_ref_B is preferred
+                        chosen = item["human_ref_B"]
+                        rejected = item["human_ref_A"]
+                    
+                    paired_dataset.append({
+                        "prompt": prompt,
+                        "chosen": chosen,
+                        "rejected": rejected
+                    })
+                elif isinstance(item, dict) and len(item) >= 3:
+                    # Try to extract from generic dictionary with at least 3 fields
+                    keys = list(item.keys())
+                    if len(keys) >= 3:
+                        prompt_key = keys[0]
+                        chosen_key = keys[1]
+                        rejected_key = keys[2]
+                        
+                        paired_dataset.append({
+                            "prompt": item[prompt_key],
+                            "chosen": item[chosen_key],
+                            "rejected": item[rejected_key]
+                        })
+                else:
+                    logger.warning(f"Could not process item format: {type(item)}")
+            
+            if not paired_dataset:
+                raise ValueError("Failed to extract paired dataset using standard format")
+                
+            logger.info(f"Successfully extracted {len(paired_dataset)} paired examples")
+            
+        except Exception as e:
+            logger.error(f"Error extracting paired dataset: {e}")
+            logger.warning("Dataset format not compatible with DPO format requirements")
+            paired_dataset = []
+            raise ValueError("Could not create paired dataset from the provided data format")
         
         # Get num_epochs from config
         num_epochs = config["rlhf"]["dpo"].get("num_epochs", 3)

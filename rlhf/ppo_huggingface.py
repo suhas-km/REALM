@@ -140,7 +140,7 @@ class HuggingFacePPOTrainer:
         
     def train(self, dataset: Dict, num_epochs: int = 1, max_steps: int = 100, checkpoint_interval: int = 1):
         """Train the model using TRL 0.16.1's PPO implementation"""
-        logger.info(f"Starting PPO training with HuggingFace TRL 0.16.1 for {num_epochs} epochs, max {max_steps} steps")
+        logger.info(f"Starting PPO training with HuggingFace TRL 0.16.1 for {num_epochs} epochs, max {max_steps if max_steps else 'all'} steps")
         
         # Prepare dataset
         hf_dataset = self._prepare_dataset(dataset)
@@ -148,9 +148,12 @@ class HuggingFacePPOTrainer:
             logger.error("Cannot train with empty dataset")
             return self.model
         
-        # Limit steps if needed
-        if max_steps and max_steps < len(hf_dataset):
+        # Limit steps if needed (max_steps=0 means use full dataset)
+        if max_steps and max_steps > 0 and max_steps < len(hf_dataset):
+            logger.info(f"Limiting dataset to {max_steps} examples (from {len(hf_dataset)})")
             hf_dataset = hf_dataset.select(range(max_steps))
+        else:
+            logger.info(f"Using full dataset with {len(hf_dataset)} examples")
         
         # Create a minimal PPOTrainer with only the most essential parameters
         # that should work across different versions

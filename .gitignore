@@ -31,3 +31,6 @@ realmVenv/
 
 #uv 
 /uv.lock
+
+#ssh
+/.ssh
