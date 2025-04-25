@@ -52,16 +52,17 @@ def main():
     parser = argparse.ArgumentParser(description="Combined Reward Model for RLHF")
     parser.add_argument("--config", type=str, default="config/config.yaml", help="Path to configuration file")
     parser.add_argument("--mode", type=str, choices=["predict", "ppo", "dpo", "qrm_ppo", "qrm_dpo", "evaluate"], default="predict", help="Operation mode")
-    parser.add_argument("--model_path", type=str, default=None, help="Path to model checkpoint (overrides config.yaml model_name, required for evaluate mode)")
     parser.add_argument("--prompt", type=str, default=None, help="Input prompt for model")
     parser.add_argument("--response", type=str, default=None, help="Response to evaluate (for predict mode)")
-    # Authentication is now handled via environment variables (HUGGINGFACE_TOKEN)
+    # Authentication is handled via huggingface-cli login
     parser.add_argument("--max_samples", type=int, default=1000, help="Maximum number of training samples to use")
     parser.add_argument("--output_file", type=str, default=None, help="Output file for evaluation results")
     parser.add_argument("--dataset_path", type=str, default=None, help="Path to dataset for RLHF (used in ppo/dpo mode)")
     parser.add_argument("--output_dir", type=str, default=None, help="Directory to save the fine-tuned model (defaults to 'models/ppo_finetuned' for PPO)")
     parser.add_argument("--checkpoint_interval", type=int, default=1, help="Save checkpoints every N epochs (PPO mode only)")
     parser.add_argument("--batch_size", type=int, default=None, help="Batch size (overrides config.yaml batch_size)")
+    parser.add_argument("--model_type", type=str, default="base", help="Model type for evaluation mode")
+    parser.add_argument("--max_new_tokens", type=int, default=128, help="Maximum new tokens for generation in evaluate mode")
     args = parser.parse_args()
     
     # Load configuration
@@ -135,14 +136,8 @@ def main():
         logger.info(f"Checkpoints will be saved to: {checkpoint_dir}")
         logger.info(f"Final model will be saved to: {output_dir}")
         
-        # If model_path is provided, override the one in config
-        if args.model_path:
-            # Override config with command line argument
-            config["rlhf"]["ppo"]["model_name"] = args.model_path
-            logger.info(f"Using model path from command line: {args.model_path}")
-        else:
-            # Use the one from config
-            logger.info(f"Using model path from config: {config['rlhf']['ppo']['model_name']}")
+        # Use model from config
+        logger.info(f"Using model path from config: {config['rlhf']['ppo']['model_name']}")
             
         # Use Hugging Face's PPO Trainer implementation
         logger.info("Using HuggingFace's PPO implementation")
@@ -246,14 +241,8 @@ def main():
             alpha=alpha
         )
         
-        # If model_path is provided, override the one in config
-        if args.model_path:
-            # Override config with command line argument
-            config["rlhf"]["dpo"]["model_name"] = args.model_path
-            logger.info(f"Using model path from command line: {args.model_path}")
-        else:
-            # Use the one from config
-            logger.info(f"Using model path from config: {config['rlhf']['dpo']['model_name']}")
+        # Use model from config
+        logger.info(f"Using model path from config: {config['rlhf']['dpo']['model_name']}")
         
         # Use Hugging Face's DPO Trainer implementation
         logger.info("Using HuggingFace's DPO implementation")
@@ -351,14 +340,8 @@ def main():
         logger.info(f"Checkpoints will be saved to: {checkpoint_dir}")
         logger.info(f"Final model will be saved to: {output_dir}")
         
-        # If model_path is provided, override the one in config
-        if args.model_path:
-            # Override config with command line argument
-            config["rlhf"]["ppo"]["model_name"] = args.model_path
-            logger.info(f"Using model path from command line: {args.model_path}")
-        else:
-            # Use the one from config
-            logger.info(f"Using model path from config: {config['rlhf']['ppo']['model_name']}")
+        # Use model from config
+        logger.info(f"Using model path from config: {config['rlhf']['ppo']['model_name']}")
         
         # Use Hugging Face's PPO Trainer implementation directly with QRM reward model
         logger.info("Using HuggingFace's PPO implementation with direct QRM reward model")
@@ -437,14 +420,8 @@ def main():
             logger.warning(f"Could not create symlink to latest model: {e}")
     
     elif args.mode == "qrm_dpo":
-        # If model_path is provided, override the one in config
-        if args.model_path:
-            # Override config with command line argument
-            config["rlhf"]["dpo"]["model_name"] = args.model_path
-            logger.info(f"Using model path from command line: {args.model_path}")
-        else:
-            # Use the one from config
-            logger.info(f"Using model path from config: {config['rlhf']['dpo']['model_name']}")
+        # Use model from config
+        logger.info(f"Using model path from config: {config['rlhf']['dpo']['model_name']}")
         
         # Use Hugging Face's DPO Trainer implementation
         logger.info("Using HuggingFace's DPO implementation with direct QRM reward model")
@@ -545,10 +522,6 @@ def main():
             logger.warning(f"Could not create symlink to latest model: {e}")
         
     elif args.mode == "evaluate":
-        # Check if model path is provided
-        if args.model_path is None:
-            raise ValueError("Model path must be provided for evaluate mode")
-        
         # Create output directory for evaluation results if not specified
         if args.output_file is None:
             os.makedirs("evaluation_results", exist_ok=True)
@@ -558,19 +531,28 @@ def main():
         # Ensure the output directory exists
         os.makedirs(os.path.dirname(args.output_file), exist_ok=True)
         
-        logger.info(f"Evaluating model: {args.model_path}")
-        logger.info(f"Model type: {args.model_type}")
+        # Use model from config based on model_type parameter
+        if args.model_type == "ppo" or args.model_type == "qrm_ppo":
+            model_path = config["rlhf"]["ppo"]["model_name"]
+        elif args.model_type == "dpo" or args.model_type == "qrm_dpo":
+            model_path = config["rlhf"]["dpo"]["model_name"]
+        else:
+            # Default to using PPO model path
+            model_path = config["rlhf"]["ppo"]["model_name"]
+        
+        logger.info(f"Evaluating model type: {args.model_type}")
+        logger.info(f"Using model path from config: {model_path}")
         logger.info(f"Results will be saved to: {args.output_file}")
         
         # Load model and tokenizer
         try:
-            logger.info(f"Loading model and tokenizer from: {args.model_path}")
+            logger.info(f"Loading model and tokenizer from: {model_path}")
             model = AutoModelForCausalLM.from_pretrained(
-                args.model_path,
+                model_path,
                 device_map="auto" if "cuda" in str(device) else None,
                 torch_dtype=torch.float16 if "cuda" in str(device) else torch.float32
             )
-            tokenizer = AutoTokenizer.from_pretrained(args.model_path)
+            tokenizer = AutoTokenizer.from_pretrained(model_path)
             
             # Set pad token if not set
             if tokenizer.pad_token is None:
@@ -614,7 +596,7 @@ def main():
             with open(args.output_file, "w") as f:
                 # Add metadata to results
                 results["metadata"] = {
-                    "model_path": args.model_path,
+                    "model_path": model_path,
                     "model_type": args.model_type,
                     "max_new_tokens": args.max_new_tokens,
                     "batch_size": args.batch_size,

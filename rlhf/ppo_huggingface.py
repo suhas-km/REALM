@@ -1,44 +1,284 @@
 # rlhf/ppo_huggingface.py
 import os
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 import logging
-from typing import Dict, List, Optional
+import time
+import numpy as np
+from typing import Dict, List, Optional, Tuple, Union
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from datasets import Dataset
 from tqdm import tqdm
-
-# Import specific components for TRL 0.16.1
-import time
-from trl import PPOConfig, PPOTrainer, AutoModelForCausalLMWithValueHead
-from trl.core import LengthSampler
+import json
 
 from inference.predictor import RewardPredictor
-import torch.nn as nn
 
 logger = logging.getLogger(__name__)
 
-class RewardModelWrapper(nn.Module):
+class CustomPPO:
     """
-    Wrapper class to make RewardPredictor compatible with TRL's PPOTrainer
-    which expects reward_model to be a PyTorch nn.Module
+    Custom PPO implementation for language models, specifically designed for
+    Llama 3.1 8B Instruct with harmonic blend reward on the SHP dataset.
     """
-    def __init__(self, reward_predictor):
-        super().__init__()
-        self.reward_predictor = reward_predictor
+    def __init__(
+        self, 
+        model,
+        tokenizer,
+        device: torch.device,
+        config: Dict,
+    ):
+        self.model = model
+        self.tokenizer = tokenizer
+        self.device = device
+        self.config = config
         
-    def forward(self, prompts, responses):
-        # Convert list inputs to individual rewards
-        rewards = []
-        for prompt, response in zip(prompts, responses):
-            reward = self.reward_predictor.predict(prompt, response)
-            rewards.append(reward)
-        # Return tensor of rewards
-        return torch.tensor(rewards, device=self.reward_predictor.device)
+        # PPO hyperparameters
+        self.cliprange = config.get("cliprange", 0.2)
+        self.cliprange_value = config.get("cliprange_value", 0.2)
+        self.gamma = config.get("gamma", 0.99)
+        self.lam = config.get("lam", 0.95)  # GAE lambda
+        self.kl_coef = config.get("kl_penalty", 0.2)
+        self.entropy_coef = config.get("entropy_coef", 0.01)
+        
+        # Setup optimizer
+        self.learning_rate = float(config.get("learning_rate", 1.41e-5))
+        self.optimizer = torch.optim.Adam(
+            self.model.parameters(), 
+            lr=self.learning_rate,
+            betas=(0.9, 0.999),
+            eps=1e-8
+        )
+        
+        # Keep a reference model for KL divergence calculation
+        self.ref_model = None
+        self._create_reference_model()
+        
+        # Create value head
+        hidden_size = self.model.config.hidden_size
+        self.value_head = nn.Linear(hidden_size, 1, bias=False).to(device)
+        self.optimizer.add_param_group({'params': self.value_head.parameters()})
+        
+    def _create_reference_model(self):
+        """Create a reference model by copying the current model for KL calculation"""
+        self.ref_model = type(self.model)(self.model.config)
+        self.ref_model.load_state_dict(self.model.state_dict())
+        self.ref_model.to(self.device)
+        self.ref_model.eval()
+        
+        # Freeze reference model parameters
+        for param in self.ref_model.parameters():
+            param.requires_grad = False
+    
+    def _value_loss(self, values: torch.Tensor, returns: torch.Tensor, old_values: torch.Tensor):
+        """Calculate value function loss with clipping"""
+        values_clipped = old_values + torch.clamp(
+            values - old_values, -self.cliprange_value, self.cliprange_value
+        )
+        vf_loss1 = (values - returns) ** 2
+        vf_loss2 = (values_clipped - returns) ** 2
+        return 0.5 * torch.mean(torch.max(vf_loss1, vf_loss2))
+    
+    def _policy_loss(
+        self, 
+        logprobs: torch.Tensor, 
+        old_logprobs: torch.Tensor, 
+        advantages: torch.Tensor, 
+        mask: torch.Tensor
+    ):
+        """Calculate policy loss with clipping"""
+        ratio = torch.exp(logprobs - old_logprobs)
+        pg_loss1 = -advantages * ratio
+        pg_loss2 = -advantages * torch.clamp(ratio, 1.0 - self.cliprange, 1.0 + self.cliprange)
+        pg_loss = torch.mean(torch.max(pg_loss1, pg_loss2) * mask)
+        return pg_loss
+    
+    def _calculate_kl(self, logprobs: torch.Tensor, ref_logprobs: torch.Tensor, mask: torch.Tensor):
+        """Calculate KL divergence between current and reference policy"""
+        kl = (ref_logprobs - logprobs) * mask
+        return torch.mean(kl)
+    
+    def _get_logprobs(self, model, input_ids, attention_mask=None):
+        """Get log probabilities from the model"""
+        with torch.set_grad_enabled(model.training):
+            outputs = model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                return_dict=True
+            )
+            logits = outputs.logits
+            
+            # Shift logits and input_ids for next token prediction
+            shift_logits = logits[..., :-1, :].contiguous()
+            shift_ids = input_ids[..., 1:].contiguous()
+            
+            # Create attention mask for shifted sequence if provided
+            if attention_mask is not None:
+                shift_mask = attention_mask[..., 1:].contiguous()
+            else:
+                shift_mask = torch.ones_like(shift_ids)
+            
+            # Calculate log probabilities
+            log_probs = F.log_softmax(shift_logits, dim=-1)
+            
+            # Get log prob of each chosen token
+            token_log_probs = log_probs.gather(-1, shift_ids.unsqueeze(-1)).squeeze(-1)
+            
+            # Apply mask to get valid log probs
+            token_log_probs = token_log_probs * shift_mask
+            
+            return token_log_probs, shift_mask
+    
+    def _get_values(self, hidden_states: torch.Tensor, mask: torch.Tensor):
+        """Get state values from the value head"""
+        # Use the last hidden state if hidden_states is a tuple
+        if isinstance(hidden_states, tuple):
+            hidden_states = hidden_states[0]
+            
+        # Get the last token's hidden state for each sequence
+        last_tokens = (mask.sum(dim=1) - 1).to(dtype=torch.long)
+        batch_indices = torch.arange(hidden_states.size(0), device=hidden_states.device)
+        last_hidden = hidden_states[batch_indices, last_tokens]
+        
+        # Pass through value head
+        values = self.value_head(last_hidden).squeeze(-1)
+        return values
+
+    def _calculate_returns_and_advantages(
+        self, 
+        rewards: torch.Tensor, 
+        values: torch.Tensor, 
+        dones: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Calculate returns and advantages using GAE"""
+        advantages = torch.zeros_like(rewards)
+        returns = torch.zeros_like(rewards)
+        
+        last_gae_lam = 0
+        for t in reversed(range(len(rewards))):
+            if t == len(rewards) - 1:
+                next_value = 0
+                next_done = 1
+            else:
+                next_value = values[t + 1]
+                next_done = dones[t + 1]
+            
+            delta = rewards[t] + self.gamma * next_value * (1 - next_done) - values[t]
+            advantages[t] = last_gae_lam = delta + self.gamma * self.lam * (1 - next_done) * last_gae_lam
+            returns[t] = advantages[t] + values[t]
+        
+        # Normalize advantages
+        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+        
+        return returns, advantages
+    
+    def train_step(
+        self, 
+        input_ids: torch.Tensor, 
+        attention_mask: torch.Tensor, 
+        old_logprobs: torch.Tensor,
+        old_values: torch.Tensor,
+        rewards: torch.Tensor,
+        response_mask: torch.Tensor,
+        n_updates: int = 4
+    ) -> Dict:
+        """Perform a PPO update on a batch of data"""
+        # Get current values
+        with torch.no_grad():
+            outputs = self.model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                output_hidden_states=True,
+                return_dict=True
+            )
+            values = self._get_values(outputs.hidden_states[-1], attention_mask)
+        
+        # All examples are individual sequences, so done is always 1
+        dones = torch.ones_like(rewards)
+        
+        # Calculate returns and advantages
+        returns, advantages = self._calculate_returns_and_advantages(rewards, values, dones)
+        
+        # Calculate metrics
+        value_loss_epoch = 0
+        policy_loss_epoch = 0
+        kl_epoch = 0
+        
+        # Multiple optimization epochs
+        for _ in range(n_updates):
+            # Get current log probabilities
+            current_logprobs, current_mask = self._get_logprobs(
+                self.model, input_ids, attention_mask
+            )
+            
+            # Get reference log probabilities for KL calculation
+            with torch.no_grad():
+                ref_logprobs, _ = self._get_logprobs(
+                    self.ref_model, input_ids, attention_mask
+                )
+            
+            # Calculate masked log probs
+            response_mask_shifted = response_mask[:, 1:]  # Shift to match token predictions
+            
+            # Calculate policy loss (only for generated tokens, not for prompt)
+            policy_loss = self._policy_loss(
+                current_logprobs, 
+                old_logprobs, 
+                advantages.unsqueeze(1).expand_as(current_logprobs), 
+                response_mask_shifted
+            )
+            
+            # Calculate KL divergence
+            kl = self._calculate_kl(current_logprobs, ref_logprobs, current_mask)
+            
+            # Get fresh values
+            outputs = self.model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                output_hidden_states=True,
+                return_dict=True
+            )
+            values = self._get_values(outputs.hidden_states[-1], attention_mask)
+            
+            # Calculate value loss
+            value_loss = self._value_loss(values, returns, old_values)
+            
+            # Calculate entropy for regularization
+            entropy = -torch.mean((torch.exp(current_logprobs) * current_logprobs) * response_mask_shifted)
+            
+            # Total loss
+            loss = policy_loss + 0.5 * value_loss - self.entropy_coef * entropy + self.kl_coef * kl
+            
+            # Backward pass
+            self.optimizer.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), 0.5)
+            self.optimizer.step()
+            
+            # Accumulate metrics
+            value_loss_epoch += value_loss.item()
+            policy_loss_epoch += policy_loss.item()
+            kl_epoch += kl.item()
+        
+        # Average metrics
+        metrics = {
+            "policy_loss": policy_loss_epoch / n_updates,
+            "value_loss": value_loss_epoch / n_updates,
+            "kl": kl_epoch / n_updates,
+        }
+        
+        return metrics
+    
+    def update_reference_model(self):
+        """Update the reference model with current model weights"""
+        self.ref_model.load_state_dict(self.model.state_dict())
+
 
 class HuggingFacePPOTrainer:
     """
-    PPO Trainer that leverages Hugging Face's TRL library version 0.16.1 
-    for industry-standard PPO implementation
+    Custom PPO Trainer for language models that works without relying on TRL library.
+    Specifically designed for fine-tuning Llama 3.1 8B Instruct on SHP dataset
+    with harmonic blend reward.
     """
     
     def __init__(
@@ -65,27 +305,19 @@ class HuggingFacePPOTrainer:
         model_name = config["rlhf"]["ppo"]["model_name"]
         logger.info(f"Loading model and tokenizer: {model_name}")
         
-        # Get authentication token from environment
-        auth_token = os.environ.get("HUGGINGFACE_TOKEN", None)
-            
-        # Log authentication status
-        if auth_token:
-            logger.info("Using Hugging Face authentication token from environment")
-            # Set the token in the Hugging Face hub library
-            import huggingface_hub
-            huggingface_hub.login(token=auth_token, add_to_git_credential=False)
-        else:
-            logger.warning("No Hugging Face token found in environment - gated models may not be accessible")
-            logger.info("Consider running 'huggingface-cli login' or setting HUGGINGFACE_TOKEN environment variable")
+        # Only support huggingface-cli login for authentication
+        # Remove any environment variable token options
+        logger.info("Using huggingface-cli login for authentication")
+        logger.info("If you have not authenticated, please run: huggingface-cli login")
         
         try:
-            # First try loading tokenizer and model with token
-            self.tokenizer = AutoTokenizer.from_pretrained(model_name, token=auth_token)
+            # Load tokenizer and model
+            self.tokenizer = tokenizer or AutoTokenizer.from_pretrained(model_name)
             # Set pad_token if not set
             if self.tokenizer.pad_token is None:
                 self.tokenizer.pad_token = self.tokenizer.eos_token
             
-            self.model = AutoModelForCausalLM.from_pretrained(model_name, token=auth_token)
+            self.model = model or AutoModelForCausalLM.from_pretrained(model_name)
             self.model.to(self.device)
         except Exception as e:
             # If loading fails, try different approach
@@ -96,8 +328,7 @@ class HuggingFacePPOTrainer:
                 # Try again with specific options
                 self.tokenizer = AutoTokenizer.from_pretrained(
                     model_name, 
-                    padding_side="left", 
-                    token=auth_token
+                    padding_side="left"
                 )
                 if self.tokenizer.pad_token is None:
                     self.tokenizer.pad_token = self.tokenizer.eos_token
@@ -105,51 +336,28 @@ class HuggingFacePPOTrainer:
                 self.model = AutoModelForCausalLM.from_pretrained(
                     model_name,
                     torch_dtype=torch.float16 if "cuda" in str(self.device) else torch.float32,
-                    device_map="auto" if "cuda" in str(self.device) else None,
-                    token=auth_token
+                    device_map="auto" if "cuda" in str(self.device) else None
                 )
                 self.model.to(self.device)
             except Exception as e2:
-                # If both loading attempts fail, raise error
+                # If both loading attempts fail, raise error with login instruction
                 logger.error(f"Failed to load model using alternative method: {e2}")
-                raise ValueError(f"Could not load model {model_name}: {e2}")
+                raise ValueError(f"Could not load model {model_name}. Please ensure you've run 'huggingface-cli login' to authenticate")
         
-        # Create PPO config
-        self.ppo_config = self._create_ppo_config(config["rlhf"]["ppo"])
+        # Create PPO algorithm
+        ppo_config = config["rlhf"]["ppo"]
+        self.ppo = CustomPPO(
+            model=self.model,
+            tokenizer=self.tokenizer,
+            device=self.device,
+            config=ppo_config
+        )
         
         # Set up generation args
         self.max_length = config["rlhf"]["ppo"].get("max_length", 256)
-        self.generation_kwargs = {
-            "max_new_tokens": self.max_length,
-            "top_k": 0.0,
-            "top_p": 1.0,
-            "do_sample": True,
-            "pad_token_id": self.tokenizer.pad_token_id,
-        }
+        self.batch_size = config["rlhf"]["ppo"].get("batch_size", 8)
         
-        logger.info("HuggingFace PPO Trainer initialized (for TRL version 0.16.1)")
-    
-    def _create_ppo_config(self, ppo_config_dict: Dict) -> PPOConfig:
-        """Create a minimal PPOConfig that works with TRL 0.16.1"""
-        # Use only the core parameters that are supported across TRL versions
-        config = PPOConfig(
-            learning_rate=float(ppo_config_dict.get("learning_rate", 1.41e-5)),
-            batch_size=ppo_config_dict.get("batch_size", 8),
-            mini_batch_size=ppo_config_dict.get("mini_batch_size", 1),
-        )
-        
-        # Manually set any additional parameters that might be needed
-        # These will be ignored if not supported by the current TRL version
-        for k, v in {
-            "gradient_accumulation_steps": ppo_config_dict.get("gradient_accumulation_steps", 1),
-            "kl_penalty": ppo_config_dict.get("kl_penalty", 0.2),
-        }.items():
-            try:
-                setattr(config, k, v)
-            except AttributeError:
-                logger.warning(f"PPOConfig doesn't support parameter '{k}', ignoring it")
-                
-        return config
+        logger.info("Custom PPO Trainer initialized for Llama 3.1 8B")
     
     def _prepare_dataset(self, dataset: Dict) -> Dataset:
         """Convert dict dataset to HF Dataset for PPO Trainer"""
@@ -162,17 +370,101 @@ class HuggingFacePPOTrainer:
         hf_dataset = Dataset.from_dict({"query": prompts})
         return hf_dataset
     
-    def _reward_fn(self, queries: List[str], responses: List[str]) -> List[float]:
-        """Reward function wrapper for the PPO trainer"""
-        rewards = []
-        for query, response in zip(queries, responses):
-            reward = self.reward_predictor.predict(query, response)
-            rewards.append(float(reward))
-        return rewards
+    def _generate_responses(self, prompts: List[str]) -> List[torch.Tensor]:
+        """Generate responses for a list of prompts"""
+        tokenized_prompts = []
+        max_prompt_length = 0
         
-    def train(self, dataset: Dict, num_epochs: int = 1, max_steps: int = 100, checkpoint_interval: int = 1):
-        """Train the model using TRL 0.16.1's PPO implementation"""
-        logger.info(f"Starting PPO training with HuggingFace TRL 0.16.1 for {num_epochs} epochs, max {max_steps if max_steps else 'all'} steps")
+        # Tokenize all prompts
+        for prompt in prompts:
+            tokens = self.tokenizer(prompt, return_tensors="pt", padding=False).input_ids[0]
+            tokenized_prompts.append(tokens)
+            max_prompt_length = max(max_prompt_length, len(tokens))
+        
+        responses = []
+        response_tensors = []
+        
+        # Generate responses
+        for i, tokens in enumerate(tokenized_prompts):
+            # Prepare input
+            input_ids = tokens.unsqueeze(0).to(self.device)
+            
+            # Generate with sampling
+            with torch.no_grad():
+                output = self.model.generate(
+                    input_ids=input_ids,
+                    max_new_tokens=self.max_length,
+                    do_sample=True,
+                    top_p=0.9,
+                    top_k=50,
+                    temperature=0.8,
+                    pad_token_id=self.tokenizer.pad_token_id,
+                    eos_token_id=self.tokenizer.eos_token_id,
+                )
+            
+            # Get just the response part (exclude the prompt)
+            response_tensor = output[0]
+            response = self.tokenizer.decode(response_tensor[len(tokens):], skip_special_tokens=True)
+            
+            responses.append(response)
+            response_tensors.append(response_tensor)
+            
+        return responses, response_tensors
+    
+    def _compute_rewards(self, prompts: List[str], responses: List[str]) -> torch.Tensor:
+        """Compute rewards for prompt-response pairs using harmonic blend"""
+        rewards = []
+        for prompt, response in zip(prompts, responses):
+            reward = self.reward_predictor.predict(prompt, response)
+            rewards.append(reward)
+        return torch.tensor(rewards, device=self.device)
+    
+    def _compute_logprobs_values(self, input_ids: List[torch.Tensor], response_start_indices: List[int]):
+        """Compute log probs and values for each sequence"""
+        # Pad sequences to the same length
+        max_length = max([len(ids) for ids in input_ids])
+        padded_ids = torch.ones((len(input_ids), max_length), dtype=torch.long, device=self.device) * self.tokenizer.pad_token_id
+        
+        # Create attention mask
+        attention_mask = torch.zeros((len(input_ids), max_length), dtype=torch.long, device=self.device)
+        
+        # Create response mask (1 for response tokens, 0 for prompt tokens)
+        response_mask = torch.zeros((len(input_ids), max_length), dtype=torch.long, device=self.device)
+        
+        # Fill in the tensors
+        for i, (ids, start_idx) in enumerate(zip(input_ids, response_start_indices)):
+            seq_len = len(ids)
+            padded_ids[i, :seq_len] = ids
+            attention_mask[i, :seq_len] = 1
+            response_mask[i, start_idx:seq_len] = 1
+        
+        # Get log probs and values
+        with torch.no_grad():
+            # Get log probs
+            logprobs, mask = self.ppo._get_logprobs(
+                self.model, padded_ids, attention_mask
+            )
+            
+            # Get values
+            outputs = self.model(
+                input_ids=padded_ids,
+                attention_mask=attention_mask,
+                output_hidden_states=True,
+                return_dict=True
+            )
+            values = self.ppo._get_values(outputs.hidden_states[-1], attention_mask)
+        
+        return padded_ids, attention_mask, response_mask, logprobs, values
+    
+    def train(
+        self, 
+        dataset: Dict, 
+        num_epochs: int = 1, 
+        max_steps: int = 100, 
+        checkpoint_interval: int = 1
+    ):
+        """Train the model using custom PPO implementation"""
+        logger.info(f"Starting custom PPO training for {num_epochs} epochs, max {max_steps} steps")
         
         # Prepare dataset
         hf_dataset = self._prepare_dataset(dataset)
@@ -187,280 +479,86 @@ class HuggingFacePPOTrainer:
         else:
             logger.info(f"Using full dataset with {len(hf_dataset)} examples")
         
-        # For TRL 0.16.1, we need to check the exact API
-        # Import necessary packages for PPO
-        from trl.core import LengthSampler
-        from trl import AutoModelForCausalLMWithValueHead
-        
-        logger.info("Initializing PPOTrainer compatible with TRL 0.16.1")
-        
-        try:
-            # First ensure model is in evaluation mode before conversion
-            self.model.eval()
-            
-            # Create value head model for PPO
-            logger.info("Converting model to AutoModelForCausalLMWithValueHead")
-            
-            # Get model name and authentication token
-            model_name = self.config["rlhf"]["ppo"]["model_name"]
-            auth_token = os.environ.get("HUGGINGFACE_TOKEN", None)
-            
-            # Try to import the actual PPOTrainer class to check its parameters
-            import inspect
-            from trl import PPOTrainer as TRLPPOTrainer
-            
-            # Get the signature of the PPOTrainer class
-            sig = inspect.signature(TRLPPOTrainer.__init__)
-            logger.info(f"PPOTrainer signature: {str(sig)}")
-            
-            # Convert to value head model with state dict transfer
-            ppo_model = AutoModelForCausalLMWithValueHead.from_pretrained(
-                model_name,
-                torch_dtype=torch.float16 if "cuda" in str(self.device) else torch.float32,
-                token=auth_token,
-            )
-            ppo_model.pretrained_model.load_state_dict(self.model.state_dict())
-            ppo_model = ppo_model.to(self.device)
-            
-            # Add generation_config attribute to fix TRL 0.16.1 compatibility
-            # TRL expects this attribute but AutoModelForCausalLMWithValueHead doesn't have it
-            from transformers import GenerationConfig
-            if not hasattr(ppo_model, 'generation_config') and hasattr(self.model, 'generation_config'):
-                logger.info("Adding generation_config from base model to ppo_model")
-                ppo_model.generation_config = self.model.generation_config
-            elif not hasattr(ppo_model, 'generation_config'):
-                logger.info("Creating new generation_config for ppo_model")
-                ppo_model.generation_config = GenerationConfig.from_pretrained(model_name, token=auth_token)
-                # Ensure EOS token is set correctly
-                ppo_model.generation_config.eos_token_id = self.tokenizer.eos_token_id
-            
-            # Set up PPO config for TRL 0.16.1
-            from trl.trainer import PPOConfig
-            ppo_config = PPOConfig(
-                learning_rate=float(self.ppo_config.learning_rate),
-                batch_size=self.ppo_config.batch_size, 
-                mini_batch_size=self.ppo_config.mini_batch_size,
-            )
-            # Add stop_token_id to match what TRL expects
-            ppo_config.stop_token_id = self.tokenizer.eos_token_id
-            
-            # Prepare PPO parameters based on PPOTrainer signature
-            if 'config' in sig.parameters and 'ppo_config' not in sig.parameters:
-                logger.info("Using 'config' parameter for PPOTrainer")
-                ppo_trainer = PPOTrainer(
-                    config=self.ppo_config,
-                    model=ppo_model,
-                    ref_model=None,
-                    tokenizer=self.tokenizer,
-                    dataset=hf_dataset,
-                    optimizer=None,
-                )
-            else:
-                # Try alternative initialization approach
-                from trl.trainer import PPOConfig
-                ppo_config = PPOConfig(
-                    learning_rate=float(self.ppo_config.learning_rate),
-                    batch_size=self.ppo_config.batch_size, 
-                    mini_batch_size=self.ppo_config.mini_batch_size,
-                )
-                
-                logger.info("Using standard PPOTrainer initialization")
-                
-                # Create a value model - TRL requires this for PPOTrainer
-                # For simplicity, we'll use the same architecture as the policy model
-                logger.info("Creating value model (same architecture as policy model)")
-                value_model = AutoModelForCausalLMWithValueHead.from_pretrained(
-                    model_name,
-                    torch_dtype=torch.float16 if "cuda" in str(self.device) else torch.float32,
-                    token=auth_token,
-                )
-                value_model.pretrained_model.load_state_dict(self.model.state_dict())
-                value_model = value_model.to(self.device)
-                
-                # Add generation_config to value model too
-                if not hasattr(value_model, 'generation_config') and hasattr(self.model, 'generation_config'):
-                    value_model.generation_config = self.model.generation_config
-                elif not hasattr(value_model, 'generation_config'):
-                    from transformers import GenerationConfig
-                    value_model.generation_config = GenerationConfig.from_pretrained(model_name, token=auth_token)
-                    value_model.generation_config.eos_token_id = self.tokenizer.eos_token_id
-                
-                ppo_trainer = PPOTrainer(
-                    args=ppo_config,
-                    model=ppo_model,
-                    ref_model=None,
-                    processing_class=self.tokenizer,
-                    reward_model=RewardModelWrapper(self.reward_predictor),
-                    train_dataset=hf_dataset,
-                    value_model=value_model,  # Add the value_model parameter
-                    data_collator=None
-                )
-        except Exception as e:
-            logger.error(f"Failed to initialize PPOTrainer: {e}")
-            
-            # Provide detailed information about the error
-            import traceback
-            logger.error(f"Detailed error: {traceback.format_exc()}")
-            
-            # Try importing the most basic version of PPOTrainer
-            try:
-                # Try direct import from trl.trainer
-                from trl.trainer import PPOTrainer as TrainerPPOTrainer
-                logger.info(f"Trying direct import of PPOTrainer from trl.trainer")
-                
-                # Get signature
-                sig = inspect.signature(TrainerPPOTrainer.__init__)
-                logger.info(f"Direct import PPOTrainer signature: {str(sig)}")
-                
-                # Raise informative error with signature information
-                raise ValueError(f"Could not initialize PPOTrainer. Signature is: {str(sig)}")
-            except Exception as e2:
-                logger.error(f"Error analyzing PPOTrainer: {e2}")
-                raise ValueError(f"TRL version 0.16.1 incompatibility: {e}")
-        
-        logger.info("PPOTrainer successfully initialized with TRL 0.16.1 API")
-        
-        # Train for the specified number of epochs
+        # Training loop
         for epoch in range(num_epochs):
             logger.info(f"Epoch {epoch+1}/{num_epochs}")
             
-            # Initialize metrics tracking
+            # Track metrics
             epoch_rewards = []
-            epoch_kl_divs = []
             epoch_losses = []
             
-            # Use TRL PPOTrainer to train on the dataset
-            logger.info(f"Training PPOTrainer on {len(hf_dataset)} examples for epoch {epoch+1}/{num_epochs}")
-            
-            # Configure steps: either train on entire dataset or limit to max_steps
-            total_steps = len(hf_dataset) // self.ppo_config.batch_size
-            if max_steps and max_steps > 0 and max_steps < total_steps:
-                steps_to_run = max_steps
-            else:
-                steps_to_run = total_steps
-            
-            logger.info(f"Running PPO for {steps_to_run} steps in epoch {epoch+1}")
-            
-            # Train for this epoch
-            step_results = []
-            
-            # Check if we can use the standard PPOTrainer workflow
-            can_use_standard_workflow = hasattr(ppo_trainer, 'dataloader') and hasattr(ppo_trainer, 'step')
-            
-            if can_use_standard_workflow:
-                logger.info("Using standard PPOTrainer workflow")
-                # Get dataloader from the trainer if available
-                dataloader = getattr(ppo_trainer, 'dataloader', None)
-                if dataloader is None:
-                    # Fallback: create a dataloader manually if needed
-                    from torch.utils.data import DataLoader
-                    dataloader = DataLoader(
-                        hf_dataset, 
-                        batch_size=self.ppo_config.batch_size, 
-                        shuffle=True
-                    )
+            # Process data in batches
+            for i in range(0, len(hf_dataset), self.batch_size):
+                batch_end = min(i + self.batch_size, len(hf_dataset))
+                batch = hf_dataset.select(range(i, batch_end))
+                prompts = batch["query"]
                 
-                # Process batches in a standard way
-                for step, batch in enumerate(dataloader):
-                    if step >= steps_to_run:
-                        break
-                        
-                    # Get query texts for logging
-                    queries = batch["query"]
-                    
-                    try:
-                        # Generate model responses using the trainer
-                        response_tensors = ppo_trainer.generate(
-                            queries,
-                            return_prompt=False,
-                            **self.generation_kwargs
-                        )
-                        
-                        # Decode responses for reward computation and logging
-                        responses = [self.tokenizer.decode(r, skip_special_tokens=True) for r in response_tensors]
-                        
-                        # Compute rewards
-                        rewards = torch.tensor(self._reward_fn(queries, responses)).to(self.device)
-                        
-                        # Run PPO step
-                        stats = ppo_trainer.step(queries, response_tensors, rewards)
-                        step_results.append(stats)
-                    except Exception as e:
-                        logger.warning(f"Error in PPO step: {e}")
-                        # Continue with next batch
-                        continue
-                    
-                    # Log example and rewards
-                    if len(queries) > 0:
-                        logger.info(f"Step {step+1}/{steps_to_run}, Example query: {queries[0][:50]}...")
-                        logger.info(f"Example response: {responses[0][:50]}...")
-                        logger.info(f"Example reward: {rewards[0].item() if len(rewards) > 0 else 'N/A'}")
-                        logger.info(f"Mean batch reward: {rewards.mean().item():.4f}")
-                        epoch_rewards.append(rewards.mean().item())
-            else:
-                # Fallback: Process batches manually with basic batching
-                logger.info("Using manual batch processing fallback")
-                for i in range(0, len(hf_dataset), self.ppo_config.batch_size):
-                    if i // self.ppo_config.batch_size >= steps_to_run:
-                        break
-                        
-                    # Get a batch of data
-                    batch_end = min(i + self.ppo_config.batch_size, len(hf_dataset))
-                    batch = hf_dataset.select(range(i, batch_end))
-                    queries = batch["query"]
-                    
-                    # Generate responses with the model directly
-                    responses = []
-                    for query in queries:
-                        # Tokenize and encode
-                        inputs = self.tokenizer(query, return_tensors="pt").to(self.device)
-                        
-                        # Generate
-                        with torch.no_grad():
-                            output_ids = self.model.generate(
-                                **inputs,
-                                max_new_tokens=self.max_length,
-                                do_sample=True,
-                                top_p=0.9,
-                                top_k=0
-                            )
-                        
-                        # Decode the response (exclude prompt)
-                        output_text = self.tokenizer.decode(output_ids[0][inputs.input_ids.shape[1]:], skip_special_tokens=True)
-                        responses.append(output_text)
-                    
-                    # Get rewards
-                    rewards = self._reward_fn(queries, responses)
-                    mean_reward = sum(rewards) / len(rewards) if rewards else 0
-                    
-                    # Log examples
-                    if len(queries) > 0:
-                        logger.info(f"Step {i//self.ppo_config.batch_size + 1}/{steps_to_run}, Example query: {queries[0][:50]}...")
-                        logger.info(f"Example response: {responses[0][:50]}...")
-                        logger.info(f"Example reward: {rewards[0] if rewards else 'N/A'}")
-                        logger.info(f"Mean batch reward: {mean_reward:.4f}")
-                        epoch_rewards.append(mean_reward)
-                    
-            # Log epoch stats
-            if epoch_rewards:
-                avg_reward = sum(epoch_rewards) / len(epoch_rewards)
-                logger.info(f"Epoch {epoch+1} average reward: {avg_reward:.4f}")
+                logger.info(f"Processing batch {i//self.batch_size + 1}/{len(hf_dataset)//self.batch_size + 1}")
                 
-                # Save checkpoint at specified intervals
-                if (epoch + 1) % checkpoint_interval == 0:
-                    checkpoint_path = os.path.join(self.checkpoint_dir, f"checkpoint-epoch-{epoch+1}")
-                    self.save_checkpoint(checkpoint_path, metadata={
-                        "epoch": epoch + 1,
-                        "avg_reward": avg_reward,
-                        "timestamp": time.strftime("%Y-%m-%d-%H-%M-%S")
-                    })
-                    logger.info(f"Saved checkpoint for epoch {epoch+1} to {checkpoint_path}")
+                # Step 1: Generate responses
+                responses, response_tensors = self._generate_responses(prompts)
+                
+                # Print example
+                if len(responses) > 0:
+                    logger.info(f"Example prompt: {prompts[0][:50]}...")
+                    logger.info(f"Example response: {responses[0][:50]}...")
+                
+                # Step 2: Calculate rewards
+                rewards = self._compute_rewards(prompts, responses)
+                logger.info(f"Batch reward mean: {rewards.mean().item():.4f}")
+                epoch_rewards.append(rewards.mean().item())
+                
+                # Step 3: Prepare inputs for PPO update
+                input_tensors = []
+                start_indices = []
+                
+                for j, prompt in enumerate(prompts):
+                    prompt_tokens = self.tokenizer(prompt, return_tensors="pt").input_ids[0]
+                    start_indices.append(len(prompt_tokens))
+                    input_tensors.append(response_tensors[j])
+                
+                # Step 4: Compute logprobs and values
+                padded_ids, attention_mask, response_mask, logprobs, values = self._compute_logprobs_values(
+                    input_tensors, start_indices
+                )
+                
+                # Step 5: PPO update
+                metrics = self.ppo.train_step(
+                    input_ids=padded_ids,
+                    attention_mask=attention_mask,
+                    old_logprobs=logprobs.detach(),
+                    old_values=values.detach(),
+                    rewards=rewards,
+                    response_mask=response_mask,
+                    n_updates=4
+                )
+                
+                # Log metrics
+                logger.info(f"Policy loss: {metrics['policy_loss']:.4f}, Value loss: {metrics['value_loss']:.4f}, KL: {metrics['kl']:.4f}")
+                epoch_losses.append(metrics['policy_loss'])
+                
+                # Update reference model every few batches
+                if i % (5 * self.batch_size) == 0:
+                    self.ppo.update_reference_model()
+                    logger.info("Updated reference model")
+            
+            # End of epoch
+            avg_reward = sum(epoch_rewards) / len(epoch_rewards) if epoch_rewards else 0
+            avg_loss = sum(epoch_losses) / len(epoch_losses) if epoch_losses else 0
+            
+            logger.info(f"Epoch {epoch+1} complete. Average reward: {avg_reward:.4f}, Average loss: {avg_loss:.4f}")
+            
+            # Save checkpoint
+            if (epoch + 1) % checkpoint_interval == 0:
+                checkpoint_path = os.path.join(self.checkpoint_dir, f"checkpoint-epoch-{epoch+1}")
+                self.save_checkpoint(checkpoint_path, metadata={
+                    "epoch": epoch + 1,
+                    "avg_reward": avg_reward,
+                    "timestamp": time.strftime("%Y-%m-%d-%H-%M-%S")
+                })
+                logger.info(f"Saved checkpoint for epoch {epoch+1} to {checkpoint_path}")
         
-        logger.info("HuggingFace PPO training completed")
-        
-        # If we used PPOTrainer, update our model reference
-        if ppo_trainer is not None:
-            self.model = ppo_trainer.model
+        logger.info("Custom PPO training completed")
         return self.model
     
     def save_checkpoint(self, checkpoint_path: str, metadata: Dict = None):
@@ -471,9 +569,11 @@ class HuggingFacePPOTrainer:
         self.model.save_pretrained(checkpoint_path)
         self.tokenizer.save_pretrained(checkpoint_path)
         
+        # Save value head
+        torch.save(self.ppo.value_head.state_dict(), os.path.join(checkpoint_path, "value_head.pt"))
+        
         # Save metadata if provided
         if metadata:
-            import json
             with open(os.path.join(checkpoint_path, "checkpoint_metadata.json"), "w") as f:
                 json.dump(metadata, f, indent=2)
         
@@ -483,22 +583,21 @@ class HuggingFacePPOTrainer:
         """Save the final fine-tuned model"""
         os.makedirs(output_dir, exist_ok=True)
         
-        # Directly save the model and tokenizer
+        # Save the model and tokenizer
         self.model.save_pretrained(output_dir)
         self.tokenizer.save_pretrained(output_dir)
         
+        # Save value head
+        torch.save(self.ppo.value_head.state_dict(), os.path.join(output_dir, "value_head.pt"))
+        
         # Save training configuration
-        import json
-        config_path = os.path.join(output_dir, "training_config.json")
-        with open(config_path, "w") as f:
-            # Extract relevant PPO config for saving
-            ppo_config = {
-                "learning_rate": self.ppo_config.learning_rate,
-                "batch_size": self.ppo_config.batch_size,
-                "mini_batch_size": self.ppo_config.mini_batch_size,
-                "model_name": self.model.config.name_or_path if hasattr(self.model.config, "name_or_path") else "custom",
-                "saved_at": time.strftime("%Y-%m-%d %H:%M:%S")
-            }
+        ppo_config = {
+            "learning_rate": self.config["rlhf"]["ppo"].get("learning_rate", 1.41e-5),
+            "batch_size": self.config["rlhf"]["ppo"].get("batch_size", 8),
+            "model_name": self.model.config.name_or_path,
+            "saved_at": time.strftime("%Y-%m-%d %H:%M:%S")
+        }
+        with open(os.path.join(output_dir, "training_config.json"), "w") as f:
             json.dump(ppo_config, f, indent=2)
         
         logger.info(f"Model, tokenizer, and config saved to {output_dir}")

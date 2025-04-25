@@ -31,9 +31,13 @@ REALM is a comprehensive framework for fine-tuning language models using Reinfor
    pip install -r requirements.txt
    ```
 
-3. Configure your environment:
-   - Copy `config/config.yaml.example` to `config/config.yaml` (if needed)
-   - Set appropriate model paths and parameters in the config file
+3. Authenticate with Hugging Face:
+   ```bash
+   huggingface-cli login
+   ```
+
+4. Configure your environment:
+   - Edit `config/config.yaml` to set appropriate model paths and parameters
 
 ## Usage
 
@@ -52,7 +56,7 @@ python main.py --mode predict --prompt "Tell me about reinforcement learning." -
 Fine-tune a model using Proximal Policy Optimization with harmonic blend reward:
 
 ```bash
-python main.py --mode ppo --model_path "meta-llama/Llama-3.1-8B-Instruct" --output_dir "./models/ppo_finetuned" --hf_token "YOUR_HF_TOKEN"
+python main.py --mode ppo --output_dir "./models/ppo_finetuned"
 ```
 
 ### Training with DPO (Harmonic Blend)
@@ -60,7 +64,7 @@ python main.py --mode ppo --model_path "meta-llama/Llama-3.1-8B-Instruct" --outp
 Fine-tune a model using Direct Preference Optimization with harmonic blend reward:
 
 ```bash
-python main.py --mode dpo --model_path "meta-llama/Llama-3.1-8B-Instruct" --hf_token "YOUR_HF_TOKEN"
+python main.py --mode dpo
 ```
 
 ### Training with QRM-PPO (Direct QRM Reward)
@@ -68,7 +72,7 @@ python main.py --mode dpo --model_path "meta-llama/Llama-3.1-8B-Instruct" --hf_t
 Fine-tune a model using PPO with direct QRM reward scoring:
 
 ```bash
-python main.py --mode qrm_ppo --model_path "meta-llama/Llama-3.1-8B-Instruct" --output_dir "./models/qrm_ppo_finetuned" --hf_token "YOUR_HF_TOKEN"
+python main.py --mode qrm_ppo --output_dir "./models/qrm_ppo_finetuned"
 ```
 
 ### Training with QRM-DPO (Direct QRM Reward)
@@ -76,7 +80,7 @@ python main.py --mode qrm_ppo --model_path "meta-llama/Llama-3.1-8B-Instruct" --
 Fine-tune a model using DPO with direct QRM reward scoring:
 
 ```bash
-python main.py --mode qrm_dpo --model_path "meta-llama/Llama-3.1-8B-Instruct" --hf_token "YOUR_HF_TOKEN"
+python main.py --mode qrm_dpo
 ```
 
 ### Evaluation on TruthfulQA
@@ -84,7 +88,7 @@ python main.py --mode qrm_dpo --model_path "meta-llama/Llama-3.1-8B-Instruct" --
 Evaluate a fine-tuned model on the TruthfulQA benchmark:
 
 ```bash
-python main.py --mode evaluate --model_path "./models/qrm_ppo_finetuned_latest" --model_type qrm_ppo
+python main.py --mode evaluate --model_type qrm_ppo --max_new_tokens 128
 ```
 
 ## Advanced Configuration
@@ -155,6 +159,5 @@ This project builds upon several key papers and libraries:
 
 - [Llama 3.1](https://ai.meta.com/blog/meta-llama-3/) by Meta AI
 - [QRM-Llama](https://github.com/nicolinho/QRM-Llama) by Nicolinho
-- [TRL Library](https://github.com/huggingface/trl) by Hugging Face
 - [Direct Preference Optimization](https://arxiv.org/abs/2305.18290) by Rafailov et al.
 - [TruthfulQA](https://arxiv.org/abs/2109.07958) by Lin et al.

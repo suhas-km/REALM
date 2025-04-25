@@ -3,7 +3,7 @@
 import os
 import torch
 import logging
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Tuple
 from transformers import AutoModelForSequenceClassification, AutoTokenizer
 
 logger = logging.getLogger(__name__)
@@ -185,3 +185,31 @@ class QRMRewardModel:
             rewards.append(reward)
         
         return rewards
+    
+    def compare(self, prompt: str, response1: str, response2: str) -> Tuple[float, float, int]:
+        """
+        Compare two responses and return their rewards and which is better.
+        Added for compatibility with the DPO trainer.
+        
+        Args:
+            prompt: The prompt text
+            response1: First response
+            response2: Second response
+            
+        Returns:
+            Tuple of (reward1, reward2, better) where better is 1 if response1 is better, 
+            2 if response2 is better, and 0 if they're equal
+        """
+        # Get rewards for both responses
+        reward1 = self.get_reward_score(prompt, response1)
+        reward2 = self.get_reward_score(prompt, response2)
+        
+        # Determine which is better
+        if reward1 > reward2:
+            better = 1
+        elif reward2 > reward1:
+            better = 2
+        else:
+            better = 0
+            
+        return reward1, reward2, better

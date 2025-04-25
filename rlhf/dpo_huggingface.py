@@ -1,30 +1,212 @@
 # rlhf/dpo_huggingface.py
 import os
+import json
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 import logging
+import time
+import numpy as np
 from typing import Dict, List, Optional, Tuple, Union
 from dataclasses import dataclass
+from tqdm import tqdm
 
-# Hugging Face's TRL library for DPO implementation
-from trl import DPOTrainer
+# Import standard HuggingFace libraries (not TRL)
 from transformers import (
     AutoTokenizer, 
     AutoModelForCausalLM, 
+    Trainer, 
     TrainingArguments,
+    DataCollatorWithPadding,
     BitsAndBytesConfig
 )
 from datasets import Dataset
 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
-from tqdm import tqdm
 
 from inference.predictor import RewardPredictor
 
 logger = logging.getLogger(__name__)
 
+class CustomDPO:
+    """
+    Custom implementation of Direct Preference Optimization (DPO) without relying on 
+    TRL library. Specifically designed for fine-tuning Llama 3.1 8B Instruct with 
+    harmonic blend reward on the SHP dataset.
+    
+    Based on the paper: "Direct Preference Optimization: Your Language Model is 
+    Secretly a Reward Model" by Rafailov et al.
+    """
+    
+    def __init__(
+        self,
+        model,
+        reference_model,
+        tokenizer,
+        device: torch.device,
+        beta: float = 0.1,
+        max_length: int = 512,
+    ):
+        self.model = model
+        self.reference_model = reference_model
+        self.tokenizer = tokenizer
+        self.device = device
+        self.beta = beta  # Controls regularization strength
+        self.max_length = max_length
+        
+        # Initialize training components
+        self.optimizer = None
+        self.scheduler = None
+        
+    def _forward_pass(self, model, input_ids, attention_mask=None, labels=None) -> torch.Tensor:
+        """Forward pass through the model to get logits"""
+        outputs = model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            labels=labels,
+            return_dict=True
+        )
+        
+        return outputs.logits
+    
+    def _get_logps(self, logits, labels, attention_mask=None):
+        """Calculate log probabilities over token sequences"""
+        # Shift predictions for autoregressive log-probs
+        shift_logits = logits[..., :-1, :].contiguous()
+        shift_labels = labels[..., 1:].contiguous()
+        
+        # Create mask for valid tokens
+        if attention_mask is not None:
+            shift_mask = attention_mask[..., 1:].contiguous()
+        else:
+            shift_mask = torch.ones_like(shift_labels)
+        
+        # Calculate log probabilities
+        log_probs = F.log_softmax(shift_logits, dim=-1)
+        
+        # Gather logprobs corresponding to the tokens
+        token_log_probs = log_probs.gather(
+            dim=-1, 
+            index=shift_labels.unsqueeze(-1)
+        ).squeeze(-1)
+        
+        # Mask out padding tokens
+        token_log_probs = token_log_probs * shift_mask
+        
+        # Sum token log probs to get sequence log probs
+        sequence_log_probs = token_log_probs.sum(dim=-1)
+        
+        return sequence_log_probs
+        
+    def dpo_loss(
+        self,
+        policy_chosen_logps: torch.Tensor,
+        policy_rejected_logps: torch.Tensor,
+        reference_chosen_logps: torch.Tensor,
+        reference_rejected_logps: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Calculate DPO loss as described in the original paper.
+        
+        Args:
+            policy_chosen_logps: Log probs from policy model for chosen responses
+            policy_rejected_logps: Log probs from policy model for rejected responses
+            reference_chosen_logps: Log probs from reference model for chosen responses
+            reference_rejected_logps: Log probs from reference model for rejected responses
+            
+        Returns:
+            DPO loss
+        """
+        # Log ratios for chosen and rejected completions
+        chosen_ratio = policy_chosen_logps - reference_chosen_logps
+        rejected_ratio = policy_rejected_logps - reference_rejected_logps
+        
+        # The core DPO loss
+        logits = chosen_ratio - rejected_ratio
+        
+        # Mathematically, this is DPO loss: -log_sigmoid(β * (r_θ(x,y_w) - r_θ(x,y_l)))
+        # Where r_θ is the implied reward: log(π_θ(y|x)/π_ref(y|x))
+        losses = -F.logsigmoid(self.beta * logits)
+        
+        # Return mean loss
+        return losses.mean()
+    
+    def train_step(
+        self,
+        prompts_input_ids: torch.Tensor,
+        prompts_attention_mask: torch.Tensor,
+        chosen_input_ids: torch.Tensor,
+        chosen_attention_mask: torch.Tensor,
+        rejected_input_ids: torch.Tensor,
+        rejected_attention_mask: torch.Tensor
+    ) -> Dict:
+        """Perform a single DPO training step"""
+        # Move inputs to device
+        prompts_input_ids = prompts_input_ids.to(self.device)
+        prompts_attention_mask = prompts_attention_mask.to(self.device)
+        chosen_input_ids = chosen_input_ids.to(self.device)
+        chosen_attention_mask = chosen_attention_mask.to(self.device)
+        rejected_input_ids = rejected_input_ids.to(self.device)
+        rejected_attention_mask = rejected_attention_mask.to(self.device)
+        
+        # Get logprobs from policy model for chosen responses
+        chosen_logits = self._forward_pass(self.model, chosen_input_ids, chosen_attention_mask)
+        policy_chosen_logps = self._get_logps(
+            chosen_logits,
+            chosen_input_ids, 
+            chosen_attention_mask
+        )
+        
+        # Get logprobs from policy model for rejected responses  
+        rejected_logits = self._forward_pass(self.model, rejected_input_ids, rejected_attention_mask)  
+        policy_rejected_logps = self._get_logps(
+            rejected_logits,  
+            rejected_input_ids,
+            rejected_attention_mask
+        )
+        
+        # Get logprobs from reference model for chosen responses
+        with torch.no_grad():
+            ref_chosen_logits = self._forward_pass(self.reference_model, chosen_input_ids, chosen_attention_mask)
+            reference_chosen_logps = self._get_logps(
+                ref_chosen_logits,
+                chosen_input_ids,
+                chosen_attention_mask
+            )
+            
+            # Get logprobs from reference model for rejected responses
+            ref_rejected_logits = self._forward_pass(self.reference_model, rejected_input_ids, rejected_attention_mask)
+            reference_rejected_logps = self._get_logps(
+                ref_rejected_logits,
+                rejected_input_ids,
+                rejected_attention_mask
+            )
+        
+        # Calculate the DPO loss
+        loss = self.dpo_loss(
+            policy_chosen_logps,
+            policy_rejected_logps,
+            reference_chosen_logps,
+            reference_rejected_logps
+        )
+        
+        # Backward pass
+        if self.optimizer is not None:
+            self.optimizer.zero_grad()
+            loss.backward()
+            self.optimizer.step()
+            if self.scheduler is not None:
+                self.scheduler.step()
+        
+        return {
+            "loss": loss.item(),
+        }
+
+
 class HuggingFaceDPOTrainer:
     """
-    DPO Trainer using Hugging Face's TRL library for industry-standard implementation
-    of Direct Preference Optimization for RLHF.
+    Custom DPO Trainer that doesn't rely on TRL library.
+    Specifically designed for fine-tuning Llama 3.1 8B Instruct on SHP dataset
+    with harmonic blend reward.
     """
     
     def __init__(
@@ -47,6 +229,10 @@ class HuggingFaceDPOTrainer:
         dpo_config = config["rlhf"]["dpo"]
         model_name = dpo_config["model_name"]
         logger.info(f"Loading model and tokenizer for DPO: {model_name}")
+        
+        # Only support huggingface-cli login for authentication
+        logger.info("Using huggingface-cli login for authentication")
+        logger.info("If you have not authenticated, please run: huggingface-cli login")
         
         # Setup tokenizer
         if tokenizer is None:
@@ -91,7 +277,42 @@ class HuggingFaceDPOTrainer:
             self.model = get_peft_model(self.model, lora_config)
             logger.info("Applied LoRA for parameter-efficient fine-tuning")
             
-        logger.info("HuggingFace DPO Trainer initialized")
+        # Create reference model (for DPO)
+        logger.info("Creating reference model for DPO by copying policy model")
+        if self.use_peft:
+            # For PEFT, we need the original model for reference
+            self.reference_model = AutoModelForCausalLM.from_pretrained(
+                model_name,
+                device_map="auto" if "cuda" in str(self.device) else None
+            )
+        else:
+            # Clone the policy model and parameters for reference
+            self.reference_model = AutoModelForCausalLM.from_pretrained(model_name)
+            
+        # Ensure reference model is on same device but not trainable
+        self.reference_model.to(self.device)
+        for param in self.reference_model.parameters():
+            param.requires_grad = False
+            
+        # Set generation parameters
+        self.max_length = self.config["rlhf"]["dpo"].get("max_length", 512)
+        self.max_prompt_length = self.config["rlhf"]["dpo"].get("max_prompt_length", 256)
+        self.batch_size = self.config["rlhf"]["dpo"].get("batch_size", 4)
+        
+        # Get beta for DPO
+        self.beta = float(self.config["rlhf"]["dpo"].get("beta", 0.1))
+        
+        # Create DPO trainer
+        self.dpo = CustomDPO(
+            model=self.model,
+            reference_model=self.reference_model,
+            tokenizer=self.tokenizer,
+            device=self.device,
+            beta=self.beta,
+            max_length=self.max_length
+        )
+            
+        logger.info("Custom DPO Trainer initialized for Llama 3.1 8B")
 
     def _get_lora_config(self) -> LoraConfig:
         """Get LoRA configuration for PEFT"""
@@ -168,34 +389,50 @@ class HuggingFaceDPOTrainer:
         logger.info(f"Generated {len(paired_data)} response pairs from {len(prompts)} prompts")
         return paired_data
     
-    def _get_dpo_training_args(self) -> TrainingArguments:
-        """Get minimal DPO training arguments that should be compatible with most versions"""
-        dpo_config = self.config["rlhf"]["dpo"]
+    def _prepare_batch(self, examples):
+        """
+        Prepare batch for DPO training by tokenizing prompts, chosen, and rejected responses
+        """
+        prompts = examples["prompt"]
+        chosen = examples["chosen"]
+        rejected = examples["rejected"]
         
-        # Default output directory
-        output_dir = dpo_config.get("output_dir", "./dpo_output")
+        # Tokenize prompts
+        prompt_tokens = self.tokenizer(
+            prompts,
+            padding=True,
+            truncation=True,
+            max_length=self.max_prompt_length,
+            return_tensors="pt"
+        )
         
-        # Start with just the most basic parameters that should be compatible with all versions
-        try:
-            # Initialize training arguments with proper type conversions for numeric values
-            return TrainingArguments(
-                output_dir=output_dir,
-                num_train_epochs=int(dpo_config.get("num_epochs", 3)),
-                learning_rate=float(dpo_config.get("learning_rate", 5e-7)),
-                per_device_train_batch_size=int(dpo_config.get("batch_size", 4)),
-                per_device_eval_batch_size=int(dpo_config.get("batch_size", 4)),
-                gradient_accumulation_steps=int(dpo_config.get("gradient_accumulation_steps", 1)),
-                weight_decay=float(dpo_config.get("weight_decay", 0.01)),
-            )
-        except TypeError as e:
-            logger.warning(f"Got error with standard TrainingArguments: {e}")
-            logger.info("Falling back to minimal TrainingArguments")
-            # Even more minimal fallback
-            return TrainingArguments(
-                output_dir=output_dir,
-                learning_rate=float(dpo_config.get("learning_rate", 5e-7)),
-            )
+        # Tokenize chosen completions (with prompts)
+        chosen_tokens = self.tokenizer(
+            [f"{prompt} {resp}" for prompt, resp in zip(prompts, chosen)],
+            padding=True,
+            truncation=True,
+            max_length=self.max_length,
+            return_tensors="pt"
+        )
         
+        # Tokenize rejected completions (with prompts)
+        rejected_tokens = self.tokenizer(
+            [f"{prompt} {resp}" for prompt, resp in zip(prompts, rejected)],
+            padding=True,
+            truncation=True,
+            max_length=self.max_length,
+            return_tensors="pt"
+        )
+        
+        return {
+            "prompts_input_ids": prompt_tokens.input_ids,
+            "prompts_attention_mask": prompt_tokens.attention_mask,
+            "chosen_input_ids": chosen_tokens.input_ids,
+            "chosen_attention_mask": chosen_tokens.attention_mask,
+            "rejected_input_ids": rejected_tokens.input_ids,
+            "rejected_attention_mask": rejected_tokens.attention_mask
+        }
+    
     def train(
         self, 
         dataset: Optional[Dict[str, List[str]]] = None,
@@ -204,7 +441,7 @@ class HuggingFaceDPOTrainer:
         generate_pairs: bool = True
     ) -> None:
         """
-        Train the model using DPO with the reward model
+        Train the model using custom DPO implementation
         
         Args:
             dataset: Dictionary with 'prompt' key containing prompts
@@ -215,12 +452,20 @@ class HuggingFaceDPOTrainer:
         # Use provided num_epochs if specified, otherwise use config
         if num_epochs is not None:
             self.config["rlhf"]["dpo"]["num_epochs"] = num_epochs
+        else:
+            num_epochs = self.config["rlhf"]["dpo"].get("num_epochs", 3)
+            
+        # Get optimization parameters from config
+        dpo_config = self.config["rlhf"]["dpo"]
+        learning_rate = float(dpo_config.get("learning_rate", 5e-7))
         
         # Generate paired data if needed
         if paired_dataset is None and generate_pairs and dataset is not None:
             logger.info("Generating paired responses for DPO training...")
-            max_length = self.config["rlhf"]["dpo"].get("max_length", 512)
-            paired_dataset = self._generate_paired_responses(dataset["prompt"], max_length=max_length)
+            paired_dataset = self._generate_paired_responses(
+                dataset["prompt"], 
+                max_length=self.max_length
+            )
         elif paired_dataset is None and not generate_pairs:
             raise ValueError("Either paired_dataset must be provided or generate_pairs must be True")
         
@@ -229,170 +474,115 @@ class HuggingFaceDPOTrainer:
             train_dataset = Dataset.from_list(paired_dataset)
             
             # Create a validation set
-            split_ratio = self.config["rlhf"]["dpo"].get("val_split", 0.05)
+            split_ratio = dpo_config.get("val_split", 0.05)
             train_val_split = train_dataset.train_test_split(test_size=split_ratio)
             train_dataset = train_val_split["train"]
             eval_dataset = train_val_split["test"]
             
             logger.info(f"Training on {len(train_dataset)} examples, validating on {len(eval_dataset)}")
             
-            # Get training arguments
-            training_args = self._get_dpo_training_args()
+            # Setup optimizer and scheduler
+            optimizer = torch.optim.AdamW(
+                self.model.parameters(),
+                lr=learning_rate,
+                weight_decay=dpo_config.get("weight_decay", 0.01),
+                betas=(0.9, 0.999),
+                eps=1e-8
+            )
             
-            # Get beta (controls the KL penalty term in DPO loss function)
-            beta = float(self.config["rlhf"]["dpo"].get("beta", 0.1))
+            # Linear learning rate scheduler with warmup
+            warmup_steps = int(0.1 * len(train_dataset) / self.batch_size)
+            total_steps = int(num_epochs * len(train_dataset) / self.batch_size)
             
-            # Try to initialize DPO trainer with different parameter combinations
-            # to accommodate different versions of the TRL library
-            dpo_trainer = None
-            try:
-                # Try the full parameter set first
-                dpo_trainer = DPOTrainer(
-                    model=self.model,
-                    args=training_args,
-                    beta=beta,
-                    train_dataset=train_dataset,
-                    eval_dataset=eval_dataset,
-                    tokenizer=self.tokenizer,
-                    max_length=self.config["rlhf"]["dpo"].get("max_length", 512),
-                    max_prompt_length=self.config["rlhf"]["dpo"].get("max_prompt_length", 256),
-                    max_target_length=self.config["rlhf"]["dpo"].get("max_target_length", 256),
-                )
-            except TypeError as e1:
-                logger.warning(f"First DPOTrainer initialization attempt failed: {e1}")
-                try:
-                    # Try with fewer parameters
-                    dpo_trainer = DPOTrainer(
-                        model=self.model,
-                        args=training_args,
-                        train_dataset=train_dataset,
-                        eval_dataset=eval_dataset,
-                        tokenizer=self.tokenizer,
-                    )
-                except TypeError as e2:
-                    logger.warning(f"Second DPOTrainer initialization attempt failed: {e2}")
-                    try:
-                        # Try with minimal parameters as a last resort
-                        dpo_trainer = DPOTrainer(
-                            model=self.model,
-                            args=training_args,
-                            train_dataset=train_dataset,
-                            tokenizer=self.tokenizer,
-                        )
-                    except Exception as e3:
-                        logger.error(f"All DPOTrainer initialization attempts failed: {e3}")
-                        logger.info("Switching to simplified implementation")
-                        dpo_trainer = None
+            def lr_lambda(current_step):
+                if current_step < warmup_steps:
+                    return float(current_step) / float(max(1, warmup_steps))
+                return max(0.0, float(total_steps - current_step) / float(max(1, total_steps - warmup_steps)))
             
-            # If we successfully created a DPO trainer, train the model
-            if dpo_trainer is not None:
-                try:
-                    # Train the model
-                    logger.info("Starting DPO training...")
-                    dpo_trainer.train()
-                    
-                    # Update our model reference
-                    self.model = dpo_trainer.model
-                except Exception as e:
-                    logger.error(f"Error during DPO training: {e}")
-                    logger.info("Training failed, but model will still be saved")
-            else:
-                logger.info("Using simplified approach for DPO training")
-                # Implement a simplified DPO-like fine-tuning algorithm
-                # that just trains the model directly on the chosen responses
-                # and avoids the rejected ones
-                logger.info("Direct fine-tuning on positive examples")
+            scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+            
+            # Attach optimizer and scheduler to DPO
+            self.dpo.optimizer = optimizer
+            self.dpo.scheduler = scheduler
+            
+            # Training loop
+            logger.info(f"Starting DPO training for {num_epochs} epochs")
+            
+            global_step = 0
+            total_loss = 0.0
+            
+            for epoch in range(num_epochs):
+                epoch_loss = 0.0
+                epoch_steps = 0
                 
-                # Simple logging of the data we're working with
-                if len(train_dataset) > 0:
-                    logger.info(f"Example prompt: {train_dataset[0]['prompt'][:50]}...")
-                    logger.info(f"Example chosen: {train_dataset[0]['chosen'][:50]}...")
-                    logger.info(f"Example rejected: {train_dataset[0]['rejected'][:50]}...")
+                logger.info(f"Epoch {epoch+1}/{num_epochs}")
                 
-                # Simple fine-tuning approach using the tokenizer and model directly
-                from transformers import Trainer, TrainingArguments
-                
-                # Prepare dataset for fine-tuning (only on chosen responses)
-                def preprocess_function(examples):
-                    batch_prompts = examples["prompt"]
-                    batch_responses = examples["chosen"]
+                # Process data in batches
+                for i in range(0, len(train_dataset), self.batch_size):
+                    batch_end = min(i + self.batch_size, len(train_dataset))
+                    batch_size = batch_end - i
                     
-                    # Combine prompts and responses for training
-                    batch_texts = []
-                    for prompt, response in zip(batch_prompts, batch_responses):
-                        # Format as prompt + response
-                        batch_texts.append(f"{prompt} {response}")
+                    # Get batch
+                    batch = train_dataset.select(range(i, batch_end))
                     
-                    # Tokenize the combined texts
-                    encodings = self.tokenizer(batch_texts, truncation=True, padding="max_length", 
-                                               max_length=512, return_tensors="pt")
+                    # Prepare batch
+                    prepared_batch = self._prepare_batch(batch)
                     
-                    # Prepare model inputs
-                    model_inputs = {
-                        "input_ids": encodings["input_ids"],
-                        "attention_mask": encodings["attention_mask"],
-                        "labels": encodings["input_ids"].clone()  # For language modeling, targets are the same as inputs
-                    }
-                    
-                    return model_inputs
-                
-                # Process the training dataset
-                try:
-                    logger.info("Preprocessing training dataset")
-                    processed_train_dataset = train_dataset.map(
-                        preprocess_function,
-                        batched=True,
-                        remove_columns=["prompt", "chosen", "rejected"]
+                    # Run DPO training step
+                    metrics = self.dpo.train_step(
+                        prompts_input_ids=prepared_batch["prompts_input_ids"],
+                        prompts_attention_mask=prepared_batch["prompts_attention_mask"],
+                        chosen_input_ids=prepared_batch["chosen_input_ids"],
+                        chosen_attention_mask=prepared_batch["chosen_attention_mask"],
+                        rejected_input_ids=prepared_batch["rejected_input_ids"],
+                        rejected_attention_mask=prepared_batch["rejected_attention_mask"]
                     )
                     
-                    # Set up basic training arguments
-                    dpo_config = self.config["rlhf"]["dpo"]
-                    num_epochs = int(dpo_config.get("num_epochs", 3))
-                    logger.info(f"Training for {num_epochs} epochs with simplified approach")
+                    # Track metrics
+                    step_loss = metrics["loss"]
+                    total_loss += step_loss
+                    epoch_loss += step_loss
+                    global_step += 1
+                    epoch_steps += 1
                     
-                    # Get output directory
-                    output_dir = dpo_config.get("output_dir", "./dpo_output")
-                    
-                    # Simple training arguments with wandb disabled
-                    args = TrainingArguments(
-                        output_dir=output_dir,
-                        num_train_epochs=num_epochs,
-                        per_device_train_batch_size=1,  # Small batch size for safety
-                        learning_rate=float(dpo_config.get("learning_rate", 5e-7)),
-                        weight_decay=0.01,
-                        logging_steps=1,
-                        save_strategy="epoch",
-                        report_to="none",  # Disable wandb reporting
-                    )
-                    
-                    # Initialize trainer
-                    trainer = Trainer(
-                        model=self.model,
-                        args=args,
-                        train_dataset=processed_train_dataset,
-                        tokenizer=self.tokenizer,
-                    )
-                    
-                    # Train the model
-                    logger.info("Starting simplified training")
-                    trainer.train()
-                    
-                    # Update the model reference
-                    self.model = trainer.model
-                    logger.info("Simplified training completed")
-                    
-                except Exception as e:
-                    logger.error(f"Error during simplified training: {e}")
-                    logger.info("Simplified training failed, but will still save the model")
+                    # Log metrics periodically
+                    if global_step % 10 == 0:
+                        logger.info(f"Step {global_step}: loss = {step_loss:.4f}, avg loss = {total_loss/global_step:.4f}")
+                
+                # End of epoch
+                epoch_avg_loss = epoch_loss / epoch_steps
+                logger.info(f"Epoch {epoch+1} complete. Average loss: {epoch_avg_loss:.4f}")
+                
+                # Save checkpoint
+                checkpoint_path = os.path.join("models", f"dpo_checkpoint_epoch_{epoch+1}")
+                self.save_checkpoint(checkpoint_path, {
+                    "epoch": epoch + 1,
+                    "avg_loss": epoch_avg_loss,
+                    "timestamp": time.strftime("%Y-%m-%d-%H-%M-%S")
+                })
             
-            # Save the model regardless of which approach was used
+            # Save the final model
             output_dir = os.path.join("models", "dpo_finetuned")
             self.save_model(output_dir)
             
-            return dpo_trainer
+            logger.info("DPO training completed")
         else:
             logger.error("No paired data available for DPO training")
-            return None
+    
+    def save_checkpoint(self, checkpoint_path: str, metadata: Dict = None):
+        """Save a checkpoint during training with metadata"""
+        os.makedirs(checkpoint_path, exist_ok=True)
+        
+        # Save the model and tokenizer
+        self.model.save_pretrained(checkpoint_path)
+        self.tokenizer.save_pretrained(checkpoint_path)
+        
+        # Save metadata if provided
+        if metadata:
+            with open(os.path.join(checkpoint_path, "checkpoint_metadata.json"), "w") as f:
+                json.dump(metadata, f, indent=2)
+        
+        logger.info(f"Checkpoint saved to {checkpoint_path}")
     
     def save_model(self, output_dir: str) -> None:
         """Save the fine-tuned model and tokenizer"""
@@ -415,4 +605,16 @@ class HuggingFaceDPOTrainer:
             
         # Save tokenizer
         self.tokenizer.save_pretrained(output_dir)
-        logger.info(f"Model and tokenizer saved to {output_dir}")
+        
+        # Save training configuration
+        dpo_config = {
+            "learning_rate": self.config["rlhf"]["dpo"].get("learning_rate", 5e-7),
+            "batch_size": self.config["rlhf"]["dpo"].get("batch_size", 4),
+            "beta": self.beta,
+            "model_name": self.model.config.name_or_path,
+            "saved_at": time.strftime("%Y-%m-%d %H:%M:%S")
+        }
+        with open(os.path.join(output_dir, "training_config.json"), "w") as f:
+            json.dump(dpo_config, f, indent=2)
+        
+        logger.info(f"Model, tokenizer, and config saved to {output_dir}")
