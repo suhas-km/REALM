@@ -34,3 +34,6 @@ realmVenv/
 
 #ssh
 /.ssh
+
+#keys
+*.pem
