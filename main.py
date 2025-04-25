@@ -55,14 +55,13 @@ def main():
     parser.add_argument("--model_path", type=str, default=None, help="Path to model checkpoint (overrides config.yaml model_name, required for evaluate mode)")
     parser.add_argument("--prompt", type=str, default=None, help="Input prompt for model")
     parser.add_argument("--response", type=str, default=None, help="Response to evaluate (for predict mode)")
-    parser.add_argument("--batch_size", type=int, default=None, help="Batch size (overrides config.yaml batch_size)")
+    # Authentication is now handled via environment variables (HUGGINGFACE_TOKEN)
     parser.add_argument("--max_samples", type=int, default=None, help="Maximum number of training samples to use")
     parser.add_argument("--output_file", type=str, default=None, help="Output file for evaluation results")
-    parser.add_argument("--hf_token", type=str, default=None, help="Hugging Face token for accessing gated models")
     parser.add_argument("--dataset_path", type=str, default=None, help="Path to dataset for RLHF (used in ppo/dpo mode)")
     parser.add_argument("--output_dir", type=str, default=None, help="Directory to save the fine-tuned model (defaults to 'models/ppo_finetuned' for PPO)")
     parser.add_argument("--checkpoint_interval", type=int, default=1, help="Save checkpoints every N epochs (PPO mode only)")
-    parser.add_argument("--hf_token", type=str, default=None, help="Hugging Face API token for accessing gated models")
+    parser.add_argument("--batch_size", type=int, default=None, help="Batch size (overrides config.yaml batch_size)")
     args = parser.parse_args()
     
     # Load configuration
@@ -151,8 +150,7 @@ def main():
             config=config,
             reward_predictor=predictor,
             device=device,
-            checkpoint_dir=checkpoint_dir,
-            token=args.hf_token
+            checkpoint_dir=checkpoint_dir
         )
         
         # Load and process SHP dataset using the processors.py
@@ -364,8 +362,7 @@ def main():
             config=config,
             reward_predictor=reward_model,  # Use QRM reward model directly
             device=device,
-            checkpoint_dir=checkpoint_dir,
-            token=args.hf_token
+            checkpoint_dir=checkpoint_dir
         )
         
         # Load and process SHP dataset using the processors.py

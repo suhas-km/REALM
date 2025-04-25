@@ -29,8 +29,7 @@ class HuggingFacePPOTrainer:
         tokenizer=None,
         model=None,
         device: Optional[torch.device] = None,
-        checkpoint_dir: Optional[str] = None,
-        token: Optional[str] = None
+        checkpoint_dir: Optional[str] = None
     ):
         self.config = config
         self.reward_predictor = reward_predictor
@@ -47,18 +46,15 @@ class HuggingFacePPOTrainer:
         model_name = config["rlhf"]["ppo"]["model_name"]
         logger.info(f"Loading model and tokenizer: {model_name}")
         
-        # Prepare authentication token if provided
-        auth_token = token
-        if auth_token is None:
-            # Try to get token from environment
-            auth_token = os.environ.get("HUGGINGFACE_TOKEN", None)
+        # Get authentication token from environment
+        auth_token = os.environ.get("HUGGINGFACE_TOKEN", None)
             
         # Log authentication status
         if auth_token:
-            logger.info("Using provided Hugging Face authentication token")
+            logger.info("Using Hugging Face authentication token from environment")
         else:
-            logger.warning("No Hugging Face token provided - gated models may not be accessible")
-            logger.info("If this fails, consider running 'huggingface-cli login' first")
+            logger.warning("No Hugging Face token found in environment - gated models may not be accessible")
+            logger.info("Consider running 'huggingface-cli login' or setting HUGGINGFACE_TOKEN environment variable")
         
         try:
             # First try loading tokenizer and model with token
@@ -175,9 +171,11 @@ class HuggingFacePPOTrainer:
         # First ensure model is in evaluation mode before conversion
         self.model.eval()
         
-        # Get model name and token from earlier in the code
+        # Get model name from config
         model_name = self.config["rlhf"]["ppo"]["model_name"]
-        auth_token = token
+        
+        # Get authentication token from environment
+        auth_token = os.environ.get("HUGGINGFACE_TOKEN", None)
         
         # Convert standard model to one with value head
         ppo_model = AutoModelForCausalLMWithValueHead.from_pretrained(
