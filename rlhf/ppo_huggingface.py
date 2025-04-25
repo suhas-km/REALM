@@ -225,12 +225,13 @@ class HuggingFacePPOTrainer:
                 
                 logger.info("Using standard PPOTrainer initialization")
                 ppo_trainer = PPOTrainer(
-                    ppo_config,  # first positional argument 'args'
-                    processing_class=self.tokenizer,  # corrected parameter name
+                    args=ppo_config,  # changed from ppo_config to args=ppo_config
                     model=ppo_model,
                     ref_model=None,
-                    reward_model=self.reward_model,  # required parameter
-                    train_dataset=hf_dataset,  # corrected parameter name
+                    tokenizer=self.tokenizer,  # corrected parameter name from processing_class
+                    dataset=hf_dataset,  # corrected parameter name from train_dataset
+                    optimizer=None,
+                    data_collator=None
                 )
         except Exception as e:
             logger.error(f"Failed to initialize PPOTrainer: {e}")

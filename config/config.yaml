@@ -40,7 +40,7 @@ rlhf:
     learning_rate: 1.41e-5
     max_length: 512
     kl_penalty: 0.2
-    max_steps: 5000  # Process a meaningful portion of the Academia dataset (~31k examples)
+    max_steps: 31000  # Process a meaningful portion of the Academia dataset (~31k examples)
     num_epochs: 3
   
   dpo:
