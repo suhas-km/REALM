@@ -56,7 +56,7 @@ def main():
     parser.add_argument("--prompt", type=str, default=None, help="Input prompt for model")
     parser.add_argument("--response", type=str, default=None, help="Response to evaluate (for predict mode)")
     # Authentication is now handled via environment variables (HUGGINGFACE_TOKEN)
-    parser.add_argument("--max_samples", type=int, default=None, help="Maximum number of training samples to use")
+    parser.add_argument("--max_samples", type=int, default=1000, help="Maximum number of training samples to use")
     parser.add_argument("--output_file", type=str, default=None, help="Output file for evaluation results")
     parser.add_argument("--dataset_path", type=str, default=None, help="Path to dataset for RLHF (used in ppo/dpo mode)")
     parser.add_argument("--output_dir", type=str, default=None, help="Directory to save the fine-tuned model (defaults to 'models/ppo_finetuned' for PPO)")
