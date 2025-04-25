@@ -13,8 +13,27 @@ from trl import PPOConfig, PPOTrainer, AutoModelForCausalLMWithValueHead
 from trl.core import LengthSampler
 
 from inference.predictor import RewardPredictor
+import torch.nn as nn
 
 logger = logging.getLogger(__name__)
+
+class RewardModelWrapper(nn.Module):
+    """
+    Wrapper class to make RewardPredictor compatible with TRL's PPOTrainer
+    which expects reward_model to be a PyTorch nn.Module
+    """
+    def __init__(self, reward_predictor):
+        super().__init__()
+        self.reward_predictor = reward_predictor
+        
+    def forward(self, prompts, responses):
+        # Convert list inputs to individual rewards
+        rewards = []
+        for prompt, response in zip(prompts, responses):
+            reward = self.reward_predictor.predict(prompt, response)
+            rewards.append(reward)
+        # Return tensor of rewards
+        return torch.tensor(rewards, device=self.reward_predictor.device)
 
 class HuggingFacePPOTrainer:
     """
@@ -251,7 +270,7 @@ class HuggingFacePPOTrainer:
                     model=ppo_model,
                     ref_model=None,
                     processing_class=self.tokenizer,  # corrected from tokenizer to processing_class
-                    reward_model=self.reward_predictor,  # Add required reward_model parameter
+                    reward_model=RewardModelWrapper(self.reward_predictor),  # Add required reward_model parameter
                     train_dataset=hf_dataset,  # corrected from dataset to train_dataset
                     data_collator=None
                 )
