@@ -53,12 +53,12 @@ def main():
     parser.add_argument("--config", type=str, default="config/config.yaml", help="Path to configuration file")
     parser.add_argument("--mode", type=str, choices=["predict", "ppo", "dpo", "qrm_ppo", "qrm_dpo", "evaluate"], default="predict", help="Operation mode")
     parser.add_argument("--model_path", type=str, default=None, help="Path to model checkpoint (overrides config.yaml model_name, required for evaluate mode)")
-    parser.add_argument("--model_type", type=str, choices=["ppo", "dpo", "qrm_ppo", "qrm_dpo", "base"], default="base", help="Type of model to evaluate (used in evaluate mode)")
-    parser.add_argument("--max_new_tokens", type=int, default=128, help="Maximum new tokens to generate for evaluation (used in evaluate mode)")
-    parser.add_argument("--batch_size", type=int, default=4, help="Batch size for evaluation (used in evaluate mode)")
-    parser.add_argument("--output_file", type=str, default=None, help="Path to save evaluation results (used in evaluate mode)")
-    parser.add_argument("--prompt", type=str, default=None, help="Prompt for prediction (used in predict mode)")
-    parser.add_argument("--response", type=str, default=None, help="Response for prediction (used in predict mode)")
+    parser.add_argument("--prompt", type=str, default=None, help="Input prompt for model")
+    parser.add_argument("--response", type=str, default=None, help="Response to evaluate (for predict mode)")
+    parser.add_argument("--batch_size", type=int, default=None, help="Batch size (overrides config.yaml batch_size)")
+    parser.add_argument("--max_samples", type=int, default=None, help="Maximum number of training samples to use")
+    parser.add_argument("--output_file", type=str, default=None, help="Output file for evaluation results")
+    parser.add_argument("--hf_token", type=str, default=None, help="Hugging Face token for accessing gated models")
     parser.add_argument("--dataset_path", type=str, default=None, help="Path to dataset for RLHF (used in ppo/dpo mode)")
     parser.add_argument("--output_dir", type=str, default=None, help="Directory to save the fine-tuned model (defaults to 'models/ppo_finetuned' for PPO)")
     parser.add_argument("--checkpoint_interval", type=int, default=1, help="Save checkpoints every N epochs (PPO mode only)")
@@ -163,6 +163,18 @@ def main():
         # Check if we have data
         if train_data is None or len(train_data) == 0:
             raise ValueError("Failed to load training data for PPO mode")
+            
+        # Limit samples if max_samples is provided
+        if args.max_samples and args.max_samples > 0 and args.max_samples < len(train_data):
+            logger.info(f"Limiting training data to {args.max_samples} examples (from {len(train_data)})")
+            train_data = train_data.select(range(args.max_samples))
+        else:
+            # If no max_samples provided, use a substantial portion of the dataset instead of just 5 examples
+            default_max_samples = config["rlhf"]["ppo"].get("max_steps", 1000)
+            if default_max_samples < 100:  # If the default is too small, use at least 1000 samples
+                default_max_samples = min(1000, len(train_data))
+                config["rlhf"]["ppo"]["max_steps"] = default_max_samples
+                logger.info(f"Increasing default max_steps to {default_max_samples} for meaningful training")
             
         # Create dataset in format expected by PPO trainer
         logger.info(f"Preparing dataset with {len(train_data)} examples for PPO training")

@@ -37,3 +37,7 @@ realmVenv/
 
 #keys
 *.pem
+
+#avoid checkers
+/count_domain_samples.py
+/check_domains.py

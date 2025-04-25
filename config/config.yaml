@@ -7,6 +7,7 @@ embedding:
 
 data:
   dataset_name: "stanfordnlp/SHP"
+  filter_domain: "askacademia"  # Filter for academic domain only (approx. 31k examples)
   preprocessing:
     max_length: 1024
     batch_size: 16
@@ -39,8 +40,8 @@ rlhf:
     learning_rate: 1.41e-5
     max_length: 512
     kl_penalty: 0.2
-    max_steps: 0  # Use 0 to process the full dataset
-    num_epochs: 1
+    max_steps: 5000  # Process a meaningful portion of the Academia dataset (~31k examples)
+    num_epochs: 3
   
   dpo:
     model_name: "meta-llama/Llama-3.1-8B-Instruct"

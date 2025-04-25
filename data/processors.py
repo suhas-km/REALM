@@ -16,11 +16,13 @@ from utils.embedding_utils import LajavanessEmbedding, cosine_similarity
 logger = logging.getLogger(__name__)
 
 class SHPDataProcessor:
-    """Process the Stanford Human Preferences dataset"""
+    """Data processor for SHP (Stanford Human Preferences) dataset from HuggingFace"""
     
     def __init__(self, config: Dict):
+        """Initialize the data processor with config"""
         self.config = config
-        self.dataset_name = config["data"]["dataset_name"]
+        self.dataset_name = config.get("data", {}).get("dataset_name", "stanfordnlp/SHP")
+        self.filter_domain = config.get("data", {}).get("filter_domain", None)
         self.cache_dir = config["data"]["preprocessing"]["cache_dir"]
         self.max_length = config["data"]["preprocessing"]["max_length"]
         
@@ -51,6 +53,27 @@ class SHPDataProcessor:
                 dataset = load_dataset(self.dataset_name, data_dir=data_dir)
             else:
                 dataset = load_dataset(self.dataset_name)
+            
+            # Filter by domain if specified
+            if self.filter_domain:
+                logger.info(f"Filtering dataset for domain: {self.filter_domain}")
+                # Ensure we include _train/_validation/_test suffixes when filtering
+                for split_name in splits.copy():
+                    if split_name in dataset:
+                        domain_to_filter = f"{self.filter_domain}_{split_name}"
+                        
+                        # Filter the dataset for the specific domain
+                        filtered_dataset = dataset[split_name].filter(lambda example: example["domain"] == domain_to_filter)
+                        
+                        # Only keep the split if it contains examples after filtering
+                        if len(filtered_dataset) > 0:
+                            # Replace the original dataset with the filtered one
+                            dataset[split_name] = filtered_dataset
+                            logger.info(f"Filtered {split_name} split to {len(filtered_dataset)} examples with domain '{domain_to_filter}'")
+                        else:
+                            logger.warning(f"No examples found for domain '{domain_to_filter}' in split '{split_name}'")
+                            # Remove this split since it has no examples after filtering
+                            splits.remove(split_name)
             
             # Process and return the dataset splits
             result = {}
