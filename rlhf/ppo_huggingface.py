@@ -203,6 +203,28 @@ class HuggingFacePPOTrainer:
             ppo_model.pretrained_model.load_state_dict(self.model.state_dict())
             ppo_model = ppo_model.to(self.device)
             
+            # Add generation_config attribute to fix TRL 0.16.1 compatibility
+            # TRL expects this attribute but AutoModelForCausalLMWithValueHead doesn't have it
+            from transformers import GenerationConfig
+            if not hasattr(ppo_model, 'generation_config') and hasattr(self.model, 'generation_config'):
+                logger.info("Adding generation_config from base model to ppo_model")
+                ppo_model.generation_config = self.model.generation_config
+            elif not hasattr(ppo_model, 'generation_config'):
+                logger.info("Creating new generation_config for ppo_model")
+                ppo_model.generation_config = GenerationConfig.from_pretrained(model_name, token=auth_token)
+                # Ensure EOS token is set correctly
+                ppo_model.generation_config.eos_token_id = self.tokenizer.eos_token_id
+            
+            # Set up PPO config for TRL 0.16.1
+            from trl.trainer import PPOConfig
+            ppo_config = PPOConfig(
+                learning_rate=float(self.ppo_config.learning_rate),
+                batch_size=self.ppo_config.batch_size, 
+                mini_batch_size=self.ppo_config.mini_batch_size,
+            )
+            # Add stop_token_id to match what TRL expects
+            ppo_config.stop_token_id = self.tokenizer.eos_token_id
+            
             # Prepare PPO parameters based on PPOTrainer signature
             if 'config' in sig.parameters and 'ppo_config' not in sig.parameters:
                 logger.info("Using 'config' parameter for PPOTrainer")
