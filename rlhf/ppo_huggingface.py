@@ -225,12 +225,12 @@ class HuggingFacePPOTrainer:
                 
                 logger.info("Using standard PPOTrainer initialization")
                 ppo_trainer = PPOTrainer(
-                    args=ppo_config,  # changed from ppo_config to args=ppo_config
+                    args=ppo_config,
                     model=ppo_model,
                     ref_model=None,
-                    tokenizer=self.tokenizer,  # corrected parameter name from processing_class
-                    dataset=hf_dataset,  # corrected parameter name from train_dataset
-                    optimizer=None,
+                    processing_class=self.tokenizer,  # corrected from tokenizer to processing_class
+                    reward_model=self.reward_predictor,  # Add required reward_model parameter
+                    train_dataset=hf_dataset,  # corrected from dataset to train_dataset
                     data_collator=None
                 )
         except Exception as e:
