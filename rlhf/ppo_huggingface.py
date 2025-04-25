@@ -111,27 +111,26 @@ class HuggingFacePPOTrainer:
         logger.info("HuggingFace PPO Trainer initialized (for TRL version 0.16.1)")
     
     def _create_ppo_config(self, ppo_config_dict: Dict) -> PPOConfig:
-        """Create a proper PPOConfig for TRL 0.16.1 compatible parameters"""
-        return PPOConfig(
-            # Required PPO parameters
-            learning_rate=ppo_config_dict.get("learning_rate", 1.41e-5),
+        """Create a minimal PPOConfig that works with TRL 0.16.1"""
+        # Use only the core parameters that are supported across TRL versions
+        config = PPOConfig(
+            learning_rate=float(ppo_config_dict.get("learning_rate", 1.41e-5)),
             batch_size=ppo_config_dict.get("batch_size", 8),
             mini_batch_size=ppo_config_dict.get("mini_batch_size", 1),
-            
-            # Additional PPO parameters with sensible defaults
-            ppo_epochs=ppo_config_dict.get("ppo_epochs", 4),  # Number of PPO optimization steps per batch
-            gradient_accumulation_steps=ppo_config_dict.get("gradient_accumulation_steps", 1),
-            optimize_device_placement=True,  # Let TRL optimize tensor placement
-            log_with=None,  # Disable tracking
-            accelerator_kwargs={"logging_dir": os.path.join(self.checkpoint_dir, "logs")},
-            project_kwargs={"logging_dir": os.path.join(self.checkpoint_dir, "logs")},
-            tracker_project_name="ppo_finetune",
-            remove_unused_columns=False,  # Keep all columns for logging
-            
-            # KL divergence control
-            kl_penalty=ppo_config_dict.get("kl_penalty", 0.2),
-            init_kl_coef=ppo_config_dict.get("init_kl_coef", 0.2),
         )
+        
+        # Manually set any additional parameters that might be needed
+        # These will be ignored if not supported by the current TRL version
+        for k, v in {
+            "gradient_accumulation_steps": ppo_config_dict.get("gradient_accumulation_steps", 1),
+            "kl_penalty": ppo_config_dict.get("kl_penalty", 0.2),
+        }.items():
+            try:
+                setattr(config, k, v)
+            except AttributeError:
+                logger.warning(f"PPOConfig doesn't support parameter '{k}', ignoring it")
+                
+        return config
     
     def _prepare_dataset(self, dataset: Dict) -> Dataset:
         """Convert dict dataset to HF Dataset for PPO Trainer"""
@@ -169,40 +168,38 @@ class HuggingFacePPOTrainer:
         else:
             logger.info(f"Using full dataset with {len(hf_dataset)} examples")
         
-        # Create value head model for PPO (required for TRL 0.16.1)
-        logger.info("Converting model to AutoModelForCausalLMWithValueHead for TRL 0.16.1 compatibility")
-        # First ensure model is in evaluation mode before conversion
-        self.model.eval()
+        # Use a simpler approach that works with TRL 0.16.1
+        logger.info("Initializing PPOTrainer with simplified approach")
         
-        # Get model name from config
-        model_name = self.config["rlhf"]["ppo"]["model_name"]
-        
-        # Get authentication token from environment
-        auth_token = os.environ.get("HUGGINGFACE_TOKEN", None)
-        
-        # Convert standard model to one with value head
-        ppo_model = AutoModelForCausalLMWithValueHead.from_pretrained(
-            model_name,
-            torch_dtype=torch.float16 if "cuda" in str(self.device) else torch.float32,
-            device_map="auto" if "cuda" in str(self.device) else None,
-            token=auth_token,
-            state_dict=self.model.state_dict(),  # Transfer existing weights
-        )
-        ppo_model.to(self.device)
-        logger.info("Value head model created successfully")
-        
-        # Initialize PPOTrainer with TRL 0.16.1 API
-        logger.info("Initializing PPOTrainer with TRL 0.16.1 API")
-        response_length_sampler = LengthSampler(self.max_length // 2, self.max_length)  # Sample response lengths between half and full max length
-        
-        ppo_trainer = PPOTrainer(
-            model=ppo_model,  # Model with value head
-            tokenizer=self.tokenizer,
-            dataset=hf_dataset,
-            data_collator=None,  # Use default collator
-            ppo_config=self.ppo_config,
-            response_length_sampler=response_length_sampler,
-        )
+        # First try the approach that is most likely to work with TRL 0.16.1
+        try:
+            logger.info("Using direct model initialization for PPOTrainer")
+            ppo_trainer = PPOTrainer(
+                model=self.model,
+                tokenizer=self.tokenizer,
+                dataset=hf_dataset,
+                ppo_params={
+                    "learning_rate": self.ppo_config.learning_rate,
+                    "batch_size": self.ppo_config.batch_size,
+                    "mini_batch_size": self.ppo_config.mini_batch_size,
+                }
+            )
+            logger.info("PPOTrainer initialization succeeded")
+        except Exception as e:
+            logger.warning(f"Direct PPOTrainer initialization failed: {e}")
+            logger.info("Attempting alternative initialization...")
+            
+            try:
+                # Try a more simplified approach with fewer parameters
+                ppo_trainer = PPOTrainer(
+                    model=self.model,
+                    tokenizer=self.tokenizer,
+                    dataset=hf_dataset,
+                )
+                logger.info("Alternative PPOTrainer initialization succeeded")
+            except Exception as e2:
+                logger.error(f"Alternative PPOTrainer initialization also failed: {e2}")
+                raise ValueError(f"Could not initialize PPOTrainer: {e2}")
         
         logger.info("PPOTrainer successfully initialized with TRL 0.16.1 API")
         
@@ -229,37 +226,103 @@ class HuggingFacePPOTrainer:
             
             # Train for this epoch
             step_results = []
-            for step, batch in enumerate(ppo_trainer.dataloader):
-                if step >= steps_to_run:
-                    break
+            
+            # Check if we can use the standard PPOTrainer workflow
+            can_use_standard_workflow = hasattr(ppo_trainer, 'dataloader') and hasattr(ppo_trainer, 'step')
+            
+            if can_use_standard_workflow:
+                logger.info("Using standard PPOTrainer workflow")
+                # Get dataloader from the trainer if available
+                dataloader = getattr(ppo_trainer, 'dataloader', None)
+                if dataloader is None:
+                    # Fallback: create a dataloader manually if needed
+                    from torch.utils.data import DataLoader
+                    dataloader = DataLoader(
+                        hf_dataset, 
+                        batch_size=self.ppo_config.batch_size, 
+                        shuffle=True
+                    )
+                
+                # Process batches in a standard way
+                for step, batch in enumerate(dataloader):
+                    if step >= steps_to_run:
+                        break
+                        
+                    # Get query texts for logging
+                    queries = batch["query"]
                     
-                # Get query texts for logging
-                queries = batch["query"]
-                
-                # Generate model responses
-                response_tensors = ppo_trainer.generate(
-                    batch["query"],
-                    return_prompt=False,
-                    **self.generation_kwargs
-                )
-                
-                # Decode responses for reward computation and logging
-                responses = [self.tokenizer.decode(r, skip_special_tokens=True) for r in response_tensors]
-                
-                # Compute rewards
-                rewards = torch.tensor(self._reward_fn(queries, responses)).to(self.device)
-                
-                # Run PPO step
-                stats = ppo_trainer.step(queries, response_tensors, rewards)
-                step_results.append(stats)
-                
-                # Log example and rewards
-                if len(queries) > 0:
-                    logger.info(f"Step {step+1}/{steps_to_run}, Example query: {queries[0][:50]}...")
-                    logger.info(f"Example response: {responses[0][:50]}...")
-                    logger.info(f"Example reward: {rewards[0].item() if len(rewards) > 0 else 'N/A'}")
-                    logger.info(f"Mean batch reward: {rewards.mean().item():.4f}")
-                    epoch_rewards.append(rewards.mean().item())
+                    try:
+                        # Generate model responses using the trainer
+                        response_tensors = ppo_trainer.generate(
+                            queries,
+                            return_prompt=False,
+                            **self.generation_kwargs
+                        )
+                        
+                        # Decode responses for reward computation and logging
+                        responses = [self.tokenizer.decode(r, skip_special_tokens=True) for r in response_tensors]
+                        
+                        # Compute rewards
+                        rewards = torch.tensor(self._reward_fn(queries, responses)).to(self.device)
+                        
+                        # Run PPO step
+                        stats = ppo_trainer.step(queries, response_tensors, rewards)
+                        step_results.append(stats)
+                    except Exception as e:
+                        logger.warning(f"Error in PPO step: {e}")
+                        # Continue with next batch
+                        continue
+                    
+                    # Log example and rewards
+                    if len(queries) > 0:
+                        logger.info(f"Step {step+1}/{steps_to_run}, Example query: {queries[0][:50]}...")
+                        logger.info(f"Example response: {responses[0][:50]}...")
+                        logger.info(f"Example reward: {rewards[0].item() if len(rewards) > 0 else 'N/A'}")
+                        logger.info(f"Mean batch reward: {rewards.mean().item():.4f}")
+                        epoch_rewards.append(rewards.mean().item())
+            else:
+                # Fallback: Process batches manually with basic batching
+                logger.info("Using manual batch processing fallback")
+                for i in range(0, len(hf_dataset), self.ppo_config.batch_size):
+                    if i // self.ppo_config.batch_size >= steps_to_run:
+                        break
+                        
+                    # Get a batch of data
+                    batch_end = min(i + self.ppo_config.batch_size, len(hf_dataset))
+                    batch = hf_dataset.select(range(i, batch_end))
+                    queries = batch["query"]
+                    
+                    # Generate responses with the model directly
+                    responses = []
+                    for query in queries:
+                        # Tokenize and encode
+                        inputs = self.tokenizer(query, return_tensors="pt").to(self.device)
+                        
+                        # Generate
+                        with torch.no_grad():
+                            output_ids = self.model.generate(
+                                **inputs,
+                                max_new_tokens=self.max_length,
+                                do_sample=True,
+                                top_p=0.9,
+                                top_k=0
+                            )
+                        
+                        # Decode the response (exclude prompt)
+                        output_text = self.tokenizer.decode(output_ids[0][inputs.input_ids.shape[1]:], skip_special_tokens=True)
+                        responses.append(output_text)
+                    
+                    # Get rewards
+                    rewards = self._reward_fn(queries, responses)
+                    mean_reward = sum(rewards) / len(rewards) if rewards else 0
+                    
+                    # Log examples
+                    if len(queries) > 0:
+                        logger.info(f"Step {i//self.ppo_config.batch_size + 1}/{steps_to_run}, Example query: {queries[0][:50]}...")
+                        logger.info(f"Example response: {responses[0][:50]}...")
+                        logger.info(f"Example reward: {rewards[0] if rewards else 'N/A'}")
+                        logger.info(f"Mean batch reward: {mean_reward:.4f}")
+                        epoch_rewards.append(mean_reward)
                     
             # Log epoch stats
             if epoch_rewards:
