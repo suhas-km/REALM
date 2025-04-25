@@ -218,7 +218,6 @@ class HuggingFacePPOTrainer:
                 # Try alternative initialization approach
                 from trl.trainer import PPOConfig
                 ppo_config = PPOConfig(
-                    model_name=model_name,
                     learning_rate=float(self.ppo_config.learning_rate),
                     batch_size=self.ppo_config.batch_size, 
                     mini_batch_size=self.ppo_config.mini_batch_size,
