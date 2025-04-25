@@ -265,13 +265,34 @@ class HuggingFacePPOTrainer:
                 )
                 
                 logger.info("Using standard PPOTrainer initialization")
+                
+                # Create a value model - TRL requires this for PPOTrainer
+                # For simplicity, we'll use the same architecture as the policy model
+                logger.info("Creating value model (same architecture as policy model)")
+                value_model = AutoModelForCausalLMWithValueHead.from_pretrained(
+                    model_name,
+                    torch_dtype=torch.float16 if "cuda" in str(self.device) else torch.float32,
+                    token=auth_token,
+                )
+                value_model.pretrained_model.load_state_dict(self.model.state_dict())
+                value_model = value_model.to(self.device)
+                
+                # Add generation_config to value model too
+                if not hasattr(value_model, 'generation_config') and hasattr(self.model, 'generation_config'):
+                    value_model.generation_config = self.model.generation_config
+                elif not hasattr(value_model, 'generation_config'):
+                    from transformers import GenerationConfig
+                    value_model.generation_config = GenerationConfig.from_pretrained(model_name, token=auth_token)
+                    value_model.generation_config.eos_token_id = self.tokenizer.eos_token_id
+                
                 ppo_trainer = PPOTrainer(
                     args=ppo_config,
                     model=ppo_model,
                     ref_model=None,
-                    processing_class=self.tokenizer,  # corrected from tokenizer to processing_class
-                    reward_model=RewardModelWrapper(self.reward_predictor),  # Add required reward_model parameter
-                    train_dataset=hf_dataset,  # corrected from dataset to train_dataset
+                    processing_class=self.tokenizer,
+                    reward_model=RewardModelWrapper(self.reward_predictor),
+                    train_dataset=hf_dataset,
+                    value_model=value_model,  # Add the value_model parameter
                     data_collator=None
                 )
         except Exception as e:
