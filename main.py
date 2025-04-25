@@ -167,12 +167,16 @@ def main():
             logger.info(f"Limiting training data to {args.max_samples} examples (from {len(train_data)})")
             train_data = train_data.select(range(args.max_samples))
         else:
-            # If no max_samples provided, use a substantial portion of the dataset instead of just 5 examples
-            default_max_samples = config["rlhf"]["ppo"].get("max_steps", 1000)
-            if default_max_samples < 100:  # If the default is too small, use at least 1000 samples
-                default_max_samples = min(1000, len(train_data))
-                config["rlhf"]["ppo"]["max_steps"] = default_max_samples
-                logger.info(f"Increasing default max_steps to {default_max_samples} for meaningful training")
+            # If no max_samples provided, use a substantial portion of the dataset
+            # Use at least 1000 samples for PPO training
+            logger.info(f"No max_samples specified, using entire dataset with {len(train_data)} examples")
+            
+            # If config has a very small number of steps, increase it for meaningful training
+            min_steps = 1000
+            current_steps = config["rlhf"]["ppo"].get("max_steps", 0)
+            if current_steps < 100:
+                config["rlhf"]["ppo"]["max_steps"] = min_steps
+                logger.info(f"Increasing max_steps to {min_steps} for meaningful training")
             
         # Create dataset in format expected by PPO trainer
         logger.info(f"Preparing dataset with {len(train_data)} examples for PPO training")

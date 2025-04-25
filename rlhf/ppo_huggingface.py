@@ -168,38 +168,92 @@ class HuggingFacePPOTrainer:
         else:
             logger.info(f"Using full dataset with {len(hf_dataset)} examples")
         
-        # Use a simpler approach that works with TRL 0.16.1
-        logger.info("Initializing PPOTrainer with simplified approach")
+        # For TRL 0.16.1, we need to check the exact API
+        # Import necessary packages for PPO
+        from trl.core import LengthSampler
+        from trl import AutoModelForCausalLMWithValueHead
         
-        # First try the approach that is most likely to work with TRL 0.16.1
+        logger.info("Initializing PPOTrainer compatible with TRL 0.16.1")
+        
         try:
-            logger.info("Using direct model initialization for PPOTrainer")
-            ppo_trainer = PPOTrainer(
-                model=self.model,
-                tokenizer=self.tokenizer,
-                dataset=hf_dataset,
-                ppo_params={
-                    "learning_rate": self.ppo_config.learning_rate,
-                    "batch_size": self.ppo_config.batch_size,
-                    "mini_batch_size": self.ppo_config.mini_batch_size,
-                }
-            )
-            logger.info("PPOTrainer initialization succeeded")
-        except Exception as e:
-            logger.warning(f"Direct PPOTrainer initialization failed: {e}")
-            logger.info("Attempting alternative initialization...")
+            # First ensure model is in evaluation mode before conversion
+            self.model.eval()
             
-            try:
-                # Try a more simplified approach with fewer parameters
+            # Create value head model for PPO
+            logger.info("Converting model to AutoModelForCausalLMWithValueHead")
+            
+            # Get model name and authentication token
+            model_name = self.config["rlhf"]["ppo"]["model_name"]
+            auth_token = os.environ.get("HUGGINGFACE_TOKEN", None)
+            
+            # Try to import the actual PPOTrainer class to check its parameters
+            import inspect
+            from trl import PPOTrainer as TRLPPOTrainer
+            
+            # Get the signature of the PPOTrainer class
+            sig = inspect.signature(TRLPPOTrainer.__init__)
+            logger.info(f"PPOTrainer signature: {str(sig)}")
+            
+            # Convert to value head model with state dict transfer
+            ppo_model = AutoModelForCausalLMWithValueHead.from_pretrained(
+                model_name,
+                torch_dtype=torch.float16 if "cuda" in str(self.device) else torch.float32,
+                token=auth_token,
+            )
+            ppo_model.pretrained_model.load_state_dict(self.model.state_dict())
+            ppo_model = ppo_model.to(self.device)
+            
+            # Prepare PPO parameters based on PPOTrainer signature
+            if 'config' in sig.parameters and 'ppo_config' not in sig.parameters:
+                logger.info("Using 'config' parameter for PPOTrainer")
                 ppo_trainer = PPOTrainer(
-                    model=self.model,
+                    config=self.ppo_config,
+                    model=ppo_model,
+                    ref_model=None,
+                    tokenizer=self.tokenizer,
+                    dataset=hf_dataset,
+                    optimizer=None,
+                )
+            else:
+                # Try alternative initialization approach
+                from trl.trainer import PPOConfig
+                ppo_config = PPOConfig(
+                    model_name=model_name,
+                    learning_rate=float(self.ppo_config.learning_rate),
+                    batch_size=self.ppo_config.batch_size, 
+                    mini_batch_size=self.ppo_config.mini_batch_size,
+                )
+                
+                logger.info("Using standard PPOTrainer initialization")
+                ppo_trainer = PPOTrainer(
+                    ppo_config=ppo_config,
+                    model=ppo_model,
+                    ref_model=None,
                     tokenizer=self.tokenizer,
                     dataset=hf_dataset,
                 )
-                logger.info("Alternative PPOTrainer initialization succeeded")
+        except Exception as e:
+            logger.error(f"Failed to initialize PPOTrainer: {e}")
+            
+            # Provide detailed information about the error
+            import traceback
+            logger.error(f"Detailed error: {traceback.format_exc()}")
+            
+            # Try importing the most basic version of PPOTrainer
+            try:
+                # Try direct import from trl.trainer
+                from trl.trainer import PPOTrainer as TrainerPPOTrainer
+                logger.info(f"Trying direct import of PPOTrainer from trl.trainer")
+                
+                # Get signature
+                sig = inspect.signature(TrainerPPOTrainer.__init__)
+                logger.info(f"Direct import PPOTrainer signature: {str(sig)}")
+                
+                # Raise informative error with signature information
+                raise ValueError(f"Could not initialize PPOTrainer. Signature is: {str(sig)}")
             except Exception as e2:
-                logger.error(f"Alternative PPOTrainer initialization also failed: {e2}")
-                raise ValueError(f"Could not initialize PPOTrainer: {e2}")
+                logger.error(f"Error analyzing PPOTrainer: {e2}")
+                raise ValueError(f"TRL version 0.16.1 incompatibility: {e}")
         
         logger.info("PPOTrainer successfully initialized with TRL 0.16.1 API")
         
