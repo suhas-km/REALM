@@ -525,6 +525,17 @@ class HuggingFacePPOTrainer:
         self.max_length = config["rlhf"]["ppo"].get("max_length", 256)
         self.batch_size = config["rlhf"]["ppo"].get("batch_size", 8)
         
+    def _prepare_dataset(self, dataset: Dict) -> Dataset:
+        """Convert dict dataset to HF Dataset for PPO Trainer"""
+        prompts = dataset.get("prompt", [])
+        if not prompts:
+            logger.warning("No prompts found in dataset")
+            return None
+            
+        # Create HF dataset with prompts
+        hf_dataset = Dataset.from_dict({"query": prompts})
+        return hf_dataset
+    
     def _generate_responses(self, prompts: List[str]) -> List[torch.Tensor]:
         """Generate responses for a list of prompts"""
         tokenized_prompts = []

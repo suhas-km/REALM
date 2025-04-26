@@ -18,3 +18,4 @@ uvicorn
 requests
 openai
 sentence-transformers
+deepspeed
