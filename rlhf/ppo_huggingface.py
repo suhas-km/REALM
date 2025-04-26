@@ -20,6 +20,7 @@ class CustomPPO:
     """
     Custom PPO implementation for language models, specifically designed for
     Llama 3.1 8B Instruct with harmonic blend reward on the SHP dataset.
+    Supports multi-GPU model parallelism for efficient training.
     """
     def __init__(
         self, 
@@ -27,11 +28,20 @@ class CustomPPO:
         tokenizer,
         device: torch.device,
         config: Dict,
+        model_devices=None,
+        ref_model_devices=None,
     ):
         self.model = model
         self.tokenizer = tokenizer
         self.device = device
         self.config = config
+        self.model_devices = model_devices or [0]
+        self.ref_model_devices = ref_model_devices or [0]
+        
+        # Enable gradient checkpointing for memory efficiency
+        if hasattr(self.model, 'gradient_checkpointing_enable'):
+            self.model.gradient_checkpointing_enable()
+            logger.info("Gradient checkpointing enabled for policy model")
         
         # PPO hyperparameters
         self.cliprange = config.get("cliprange", 0.2)
@@ -41,14 +51,42 @@ class CustomPPO:
         self.kl_coef = config.get("kl_penalty", 0.2)
         self.entropy_coef = config.get("entropy_coef", 0.01)
         
-        # Setup optimizer
+        # Setup optimizer with GPU distribution if multiple devices are specified
         self.learning_rate = float(config.get("learning_rate", 1.41e-5))
-        self.optimizer = torch.optim.Adam(
-            self.model.parameters(), 
-            lr=self.learning_rate,
-            betas=(0.9, 0.999),
-            eps=1e-8
-        )
+        
+        # Use distributed training if multiple devices specified
+        if len(self.model_devices) > 1:
+            logger.info(f"Setting up distributed training across {len(self.model_devices)} GPUs for policy model")
+            try:
+                import deepspeed
+                # DeepSpeed config for tensor parallelism
+                ds_config = {
+                    "train_batch_size": config.get("batch_size", 8),
+                    "fp16": {"enabled": True},
+                    "zero_optimization": {"stage": 3},
+                    "tensor_parallel": {"tp_size": len(self.model_devices)}
+                }
+                self.model, self.optimizer, _, _ = deepspeed.initialize(
+                    model=self.model,
+                    config=ds_config
+                )
+                logger.info("DeepSpeed initialized successfully for policy model")
+            except ImportError:
+                logger.warning("DeepSpeed not found. Falling back to regular optimizer.")
+                self.optimizer = torch.optim.Adam(
+                    self.model.parameters(), 
+                    lr=self.learning_rate,
+                    betas=(0.9, 0.999),
+                    eps=1e-8
+                )
+        else:
+            # Regular optimizer setup for single GPU
+            self.optimizer = torch.optim.Adam(
+                self.model.parameters(), 
+                lr=self.learning_rate,
+                betas=(0.9, 0.999),
+                eps=1e-8
+            )
         
         # Keep a reference model for KL divergence calculation
         self.ref_model = None
@@ -62,8 +100,43 @@ class CustomPPO:
     def _create_reference_model(self):
         """Create a reference model by copying the current model for KL calculation"""
         self.ref_model = type(self.model)(self.model.config)
-        self.ref_model.load_state_dict(self.model.state_dict())
-        self.ref_model.to(self.device)
+        
+        # Handle loading state dictionary depending on model type (distributed or not)
+        if hasattr(self.model, 'module'):  # For DeepSpeed or DistributedDataParallel
+            self.ref_model.load_state_dict(self.model.module.state_dict())
+        else:
+            self.ref_model.load_state_dict(self.model.state_dict())
+        
+        # Enable memory efficient attention if available
+        if hasattr(self.ref_model.config, 'attn_implementation'):
+            self.ref_model.config.attn_implementation = "flash_attention_2"
+        
+        # Distribute reference model if multiple devices specified
+        if len(self.ref_model_devices) > 1:
+            try:
+                import deepspeed
+                # We don't need optimizer for reference model
+                ds_config = {
+                    "train_batch_size": self.config.get("batch_size", 8),
+                    "fp16": {"enabled": True},
+                    "zero_optimization": {"stage": 3},
+                    "tensor_parallel": {"tp_size": len(self.ref_model_devices)}
+                }
+                self.ref_model, _, _, _ = deepspeed.initialize(
+                    model=self.ref_model,
+                    config=ds_config
+                )
+                logger.info(f"DeepSpeed initialized for reference model across {len(self.ref_model_devices)} GPUs")
+            except ImportError:
+                # Fallback to first reference model device
+                logger.warning("DeepSpeed not found. Moving reference model to a single GPU.")
+                self.ref_model.to(f"cuda:{self.ref_model_devices[0]}")
+        else:
+            # Place on specified device
+            ref_device = f"cuda:{self.ref_model_devices[0]}"
+            logger.info(f"Moving reference model to {ref_device}")
+            self.ref_model.to(ref_device)
+        
         self.ref_model.eval()
         
         # Freeze reference model parameters
@@ -99,33 +172,67 @@ class CustomPPO:
         return torch.mean(kl)
     
     def _get_logprobs(self, model, input_ids, attention_mask=None):
-        """Get log probabilities from the model"""
+        """Get log probabilities from the model with memory optimization"""
         with torch.set_grad_enabled(model.training):
-            outputs = model(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                return_dict=True
-            )
-            logits = outputs.logits
+            # Process in chunks if input is large to avoid OOM
+            batch_size = input_ids.shape[0]
+            max_chunk_size = 2  # Process at most 2 sequences at a time
+            all_token_log_probs = []
+            all_shift_masks = []
             
-            # Shift logits and input_ids for next token prediction
-            shift_logits = logits[..., :-1, :].contiguous()
-            shift_ids = input_ids[..., 1:].contiguous()
+            for chunk_start in range(0, batch_size, max_chunk_size):
+                chunk_end = min(chunk_start + max_chunk_size, batch_size)
+                chunk_input_ids = input_ids[chunk_start:chunk_end]
+                
+                if attention_mask is not None:
+                    chunk_attention_mask = attention_mask[chunk_start:chunk_end]
+                else:
+                    chunk_attention_mask = None
+                
+                # Use mixed precision for inference
+                with torch.cuda.amp.autocast(dtype=torch.float16):
+                    outputs = model(
+                        input_ids=chunk_input_ids,
+                        attention_mask=chunk_attention_mask,
+                        return_dict=True
+                    )
+                    logits = outputs.logits
+                    
+                    # Shift logits and input_ids for next token prediction
+                    # This is the line that was causing OOM issues
+                    shift_logits = logits[..., :-1, :].contiguous()
+                    shift_ids = chunk_input_ids[..., 1:].contiguous()
+                    
+                    # Create attention mask for shifted sequence if provided
+                    if chunk_attention_mask is not None:
+                        shift_mask = chunk_attention_mask[..., 1:].contiguous()
+                    else:
+                        shift_mask = torch.ones_like(shift_ids)
+                    
+                    # Calculate log probabilities in FP16 for memory efficiency
+                    log_probs = F.log_softmax(shift_logits, dim=-1)
+                    
+                    # Get log prob of each chosen token
+                    token_log_probs = log_probs.gather(-1, shift_ids.unsqueeze(-1)).squeeze(-1)
+                    
+                    # Apply mask to get valid log probs
+                    token_log_probs = token_log_probs * shift_mask
+                
+                # Collect results from this chunk
+                all_token_log_probs.append(token_log_probs)
+                all_shift_masks.append(shift_mask)
+                
+                # Explicitly free memory
+                del outputs, logits, shift_logits, log_probs
+                torch.cuda.empty_cache()
             
-            # Create attention mask for shifted sequence if provided
-            if attention_mask is not None:
-                shift_mask = attention_mask[..., 1:].contiguous()
+            # Combine results from all chunks
+            if batch_size > max_chunk_size:
+                token_log_probs = torch.cat(all_token_log_probs, dim=0)
+                shift_mask = torch.cat(all_shift_masks, dim=0)
             else:
-                shift_mask = torch.ones_like(shift_ids)
-            
-            # Calculate log probabilities
-            log_probs = F.log_softmax(shift_logits, dim=-1)
-            
-            # Get log prob of each chosen token
-            token_log_probs = log_probs.gather(-1, shift_ids.unsqueeze(-1)).squeeze(-1)
-            
-            # Apply mask to get valid log probs
-            token_log_probs = token_log_probs * shift_mask
+                token_log_probs = all_token_log_probs[0]
+                shift_mask = all_shift_masks[0]
             
             return token_log_probs, shift_mask
     
@@ -279,6 +386,11 @@ class HuggingFacePPOTrainer:
     Custom PPO Trainer for language models that works without relying on TRL library.
     Specifically designed for fine-tuning Llama 3.1 8B Instruct on SHP dataset
     with harmonic blend reward.
+    
+    Features:
+    - Multi-GPU model parallelism support for distributed training
+    - Memory-efficient computation with mixed precision and chunking
+    - Support for tensor parallelism using DeepSpeed (if available)
     """
     
     def __init__(
@@ -288,20 +400,74 @@ class HuggingFacePPOTrainer:
         tokenizer=None,
         model=None,
         device: Optional[torch.device] = None,
-        checkpoint_dir: Optional[str] = None
+        checkpoint_dir: Optional[str] = None,
+        policy_model_devices=None,
+        ref_model_devices=None,
+        reward_model_device=None,
+        embedding_device=None
     ):
         self.config = config
         self.reward_predictor = reward_predictor
         
-        # Set device
-        self.device = device if device is not None else torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        # Setup device allocation for multi-GPU training
+        self.world_size = torch.cuda.device_count()
+        self.use_distributed = self.world_size > 1
         
-        # Set checkpoint directory
-        self.checkpoint_dir = checkpoint_dir or os.path.join("models", "ppo_checkpoints")
+        # Set up device mapping for model parallelism
+        if self.use_distributed:
+            # Default device mapping based on available GPUs
+            self.policy_model_devices = policy_model_devices or [0, 1] 
+            self.ref_model_devices = ref_model_devices or [2, 3]
+            self.reward_model_device = reward_model_device or 4
+            self.embedding_device = embedding_device or 5
+            
+            # Adjust devices if we have fewer GPUs than requested
+            if self.world_size < 6:
+                logger.warning(f"Requested 6 GPUs for optimal distribution but only {self.world_size} available. Adjusting mapping.")
+                if self.world_size >= 3:
+                    # Minimum 3 GPUs - distribute essential models
+                    self.policy_model_devices = [0]
+                    self.ref_model_devices = [1]
+                    self.reward_model_device = 2
+                    self.embedding_device = 2
+                else:
+                    # Fallback to minimal setup
+                    self.policy_model_devices = [0]
+                    self.ref_model_devices = [0]
+                    self.reward_model_device = 0 if self.world_size < 2 else 1
+                    self.embedding_device = 0 if self.world_size < 2 else 1
+        else:
+            # Single GPU setup
+            self.policy_model_devices = [0]
+            self.ref_model_devices = [0]
+            self.reward_model_device = 0
+            self.embedding_device = 0
+            
+        # Set primary device for this trainer
+        self.device = device or torch.device(f"cuda:{self.policy_model_devices[0]}" if torch.cuda.is_available() else "cpu")
+        logger.info(f"Primary device: {self.device}")
+        
+        # Display GPU allocation strategy
+        if self.use_distributed:
+            logger.info("GPU allocation for model parallelism:")
+            logger.info(f"Policy model: GPUs {self.policy_model_devices}")
+            logger.info(f"Reference model: GPUs {self.ref_model_devices}")
+            logger.info(f"Reward model: GPU {self.reward_model_device}")
+            logger.info(f"Embedding model: GPU {self.embedding_device}")
+            
+        self.checkpoint_dir = checkpoint_dir or "./checkpoints"
         os.makedirs(self.checkpoint_dir, exist_ok=True)
-        logger.info(f"Checkpoints will be saved to: {self.checkpoint_dir}")
         
-        # Model initialization
+        # Default hyperparameters
+        self.batch_size = config["rlhf"]["ppo"].get("batch_size", 8)
+        self.max_length = config["rlhf"]["ppo"].get("max_length", 512)
+        self.max_new_tokens = config["rlhf"]["ppo"].get("max_new_tokens", 256)
+        
+        # Enable mixed precision training
+        self.use_mixed_precision = config["rlhf"]["ppo"].get("mixed_precision", True)
+        self.scaler = torch.cuda.amp.GradScaler() if self.use_mixed_precision else None
+        
+        # Load tokenizer and model
         model_name = config["rlhf"]["ppo"]["model_name"]
         logger.info(f"Loading model and tokenizer: {model_name}")
         
@@ -344,32 +510,21 @@ class HuggingFacePPOTrainer:
                 logger.error(f"Failed to load model using alternative method: {e2}")
                 raise ValueError(f"Could not load model {model_name}. Please ensure you've run 'huggingface-cli login' to authenticate")
         
-        # Create PPO algorithm
-        ppo_config = config["rlhf"]["ppo"]
+        # Initialize the custom PPO algorithm with model parallelism support
+        logger.info("Custom PPO Trainer initialized for Llama 3.1 8B with model parallelism")
         self.ppo = CustomPPO(
             model=self.model,
             tokenizer=self.tokenizer,
             device=self.device,
-            config=ppo_config
+            config=config["rlhf"]["ppo"],
+            model_devices=self.policy_model_devices,
+            ref_model_devices=self.ref_model_devices,
         )
         
         # Set up generation args
         self.max_length = config["rlhf"]["ppo"].get("max_length", 256)
         self.batch_size = config["rlhf"]["ppo"].get("batch_size", 8)
         
-        logger.info("Custom PPO Trainer initialized for Llama 3.1 8B")
-    
-    def _prepare_dataset(self, dataset: Dict) -> Dataset:
-        """Convert dict dataset to HF Dataset for PPO Trainer"""
-        prompts = dataset.get("prompt", [])
-        if not prompts:
-            logger.warning("No prompts found in dataset")
-            return None
-            
-        # Create HF dataset with prompts
-        hf_dataset = Dataset.from_dict({"query": prompts})
-        return hf_dataset
-    
     def _generate_responses(self, prompts: List[str]) -> List[torch.Tensor]:
         """Generate responses for a list of prompts"""
         tokenized_prompts = []
@@ -411,48 +566,117 @@ class HuggingFacePPOTrainer:
             
         return responses, response_tensors
     
-    def _compute_rewards(self, prompts: List[str], responses: List[str]) -> torch.Tensor:
+    def _compute_rewards(self, prompts: List[str], responses: List[str]):
         """Compute rewards for prompt-response pairs using harmonic blend"""
-        rewards = []
-        for prompt, response in zip(prompts, responses):
-            reward = self.reward_predictor.predict(prompt, response)
-            rewards.append(reward)
-        return torch.tensor(rewards, device=self.device)
-    
-    def _compute_logprobs_values(self, input_ids: List[torch.Tensor], response_start_indices: List[int]):
-        """Compute log probs and values for each sequence"""
-        # Pad sequences to the same length
-        max_length = max([len(ids) for ids in input_ids])
-        padded_ids = torch.ones((len(input_ids), max_length), dtype=torch.long, device=self.device) * self.tokenizer.pad_token_id
+        # Move reward prediction to dedicated device if available
+        original_device = self.reward_predictor.device
+        if self.use_distributed and hasattr(self.reward_predictor, 'device'):
+            reward_device = f"cuda:{self.reward_model_device}"
+            logger.debug(f"Moving reward model computation to {reward_device}")
+            self.reward_predictor.device = torch.device(reward_device)
         
-        # Create attention mask
-        attention_mask = torch.zeros((len(input_ids), max_length), dtype=torch.long, device=self.device)
+        # Process in chunks to reduce memory usage
+        chunk_size = min(len(prompts), 4)  # Process max 4 prompt-response pairs at a time
+        all_rewards = []
         
-        # Create response mask (1 for response tokens, 0 for prompt tokens)
-        response_mask = torch.zeros((len(input_ids), max_length), dtype=torch.long, device=self.device)
-        
-        # Fill in the tensors
-        for i, (ids, start_idx) in enumerate(zip(input_ids, response_start_indices)):
-            seq_len = len(ids)
-            padded_ids[i, :seq_len] = ids
-            attention_mask[i, :seq_len] = 1
-            response_mask[i, start_idx:seq_len] = 1
-        
-        # Get log probs and values
-        with torch.no_grad():
-            # Get log probs
-            logprobs, mask = self.ppo._get_logprobs(
-                self.model, padded_ids, attention_mask
-            )
+        for i in range(0, len(prompts), chunk_size):
+            chunk_prompts = prompts[i:i+chunk_size]
+            chunk_responses = responses[i:i+chunk_size]
             
-            # Get values
-            outputs = self.model(
-                input_ids=padded_ids,
-                attention_mask=attention_mask,
-                output_hidden_states=True,
-                return_dict=True
-            )
-            values = self.ppo._get_values(outputs.hidden_states[-1], attention_mask)
+            chunk_rewards = self.reward_predictor.get_reward_batch(chunk_prompts, chunk_responses)
+            all_rewards.extend(chunk_rewards)
+        
+        # Restore original device
+        if self.use_distributed and hasattr(self.reward_predictor, 'device'):
+            self.reward_predictor.device = original_device
+        
+        rewards_tensor = torch.tensor(all_rewards, dtype=torch.float32).to(self.device)
+        return rewards_tensor
+    
+    def _compute_logprobs_values(self, input_tensors: List[torch.Tensor], response_start_indices: List[int]):
+        """Compute log probs and values for each sequence with memory-efficient chunking"""
+        # Determine maximum sequence length
+        max_length = max([t.size(0) for t in input_tensors])
+        batch_size = len(input_tensors)
+        
+        # Process in smaller chunks to avoid OOM
+        chunk_size = min(batch_size, 2)  # Process max 2 sequences at a time
+        all_logprobs = []
+        all_values = []
+        
+        logger.info(f"Processing {batch_size} sequences with chunk size {chunk_size}")
+        
+        for i in range(0, batch_size, chunk_size):
+            chunk_end = min(i + chunk_size, batch_size)
+            chunk_size_actual = chunk_end - i
+            logger.debug(f"Processing chunk {i//chunk_size + 1}/{(batch_size+chunk_size-1)//chunk_size}: items {i}-{chunk_end-1}")
+            
+            # Create padded tensors for this chunk
+            chunk_padded = torch.ones((chunk_size_actual, max_length), dtype=torch.long) * self.tokenizer.pad_token_id
+            chunk_attention_mask = torch.zeros((chunk_size_actual, max_length), dtype=torch.long)
+            chunk_response_mask = torch.zeros((chunk_size_actual, max_length), dtype=torch.float)
+            
+            # Fill padded tensors for this chunk
+            for j in range(chunk_size_actual):
+                idx = i + j
+                tensor = input_tensors[idx]
+                start_idx = response_start_indices[idx]
+                length = tensor.size(0)
+                
+                chunk_padded[j, :length] = tensor
+                chunk_attention_mask[j, :length] = 1
+                chunk_response_mask[j, start_idx:length] = 1
+            
+            # Move to device
+            chunk_padded = chunk_padded.to(self.device)
+            chunk_attention_mask = chunk_attention_mask.to(self.device)
+            chunk_response_mask = chunk_response_mask.to(self.device)
+            
+            # Use mixed precision to save memory
+            with torch.cuda.amp.autocast(dtype=torch.float16, enabled=self.use_mixed_precision):
+                # Get model outputs with gradient checkpointing enabled
+                model_outputs = self.model(
+                    input_ids=chunk_padded,
+                    attention_mask=chunk_attention_mask,
+                    output_hidden_states=True,
+                    return_dict=True
+                )
+                hidden_states = model_outputs.hidden_states[-1]
+                
+                # Compute values
+                chunk_values = self.ppo._get_values(hidden_states, chunk_attention_mask)
+                
+                # Compute log probabilities
+                chunk_logprobs, _ = self.ppo._get_logprobs(
+                    self.model, 
+                    chunk_padded, 
+                    chunk_attention_mask
+                )
+            
+            # Collect results
+            all_logprobs.append(chunk_logprobs)
+            all_values.append(chunk_values)
+            
+            # Explicitly free memory
+            del chunk_padded, chunk_attention_mask, chunk_response_mask
+            del model_outputs, hidden_states, chunk_logprobs, chunk_values
+            torch.cuda.empty_cache()
+        
+        # Create combined tensors for the full batch
+        padded_ids = torch.ones((batch_size, max_length), dtype=torch.long).to(self.device) * self.tokenizer.pad_token_id
+        attention_mask = torch.zeros((batch_size, max_length), dtype=torch.long).to(self.device)
+        response_mask = torch.zeros((batch_size, max_length), dtype=torch.float).to(self.device)
+        
+        # Fill the combined tensors
+        for i, (tensor, start_idx) in enumerate(zip(input_tensors, response_start_indices)):
+            length = tensor.size(0)
+            padded_ids[i, :length] = tensor.to(self.device)
+            attention_mask[i, :length] = 1
+            response_mask[i, start_idx:length] = 1
+        
+        # Combine all chunk results
+        logprobs = torch.cat(all_logprobs, dim=0) if len(all_logprobs) > 1 else all_logprobs[0]
+        values = torch.cat(all_values, dim=0) if len(all_values) > 1 else all_values[0]
         
         return padded_ids, attention_mask, response_mask, logprobs, values
     

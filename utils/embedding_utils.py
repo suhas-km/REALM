@@ -9,23 +9,45 @@ from sklearn.metrics.pairwise import cosine_similarity as sklearn_cosine_similar
 logger = logging.getLogger(__name__)
 
 class LajavanessEmbedding:
-    """Wrapper for the Lajavaness/bilingual-embedding-large model to get embeddings"""
+    """Wrapper for the Lajavaness/bilingual-embedding-large model to get embeddings
+    Supports specifying a device for multi-GPU distribution"""
     
-    def __init__(self, model_id: str = "Lajavaness/bilingual-embedding-large"):
+    def __init__(self, model_name: str = "Lajavaness/bilingual-embedding-large", device=None):
         """
         Initialize the Lajavaness Embedding model.
         
         Args:
-            model_id: Hugging Face model ID for the embedding model
+            model_name: Hugging Face model ID for the embedding model
+            device: PyTorch device to place the model on (e.g., 'cuda:0', 'cuda:1')
         """
-        self.model_id = model_id
+        self.model_id = model_name
+        self.device = device
+        
+        # Set device if provided
+        device_name = None
+        if device is not None:
+            if hasattr(device, 'type') and hasattr(device, 'index'):
+                # Handle torch.device objects
+                if device.type == 'cuda':
+                    device_name = f"cuda:{device.index}" if device.index is not None else "cuda:0"
+                else:
+                    device_name = str(device)
+            else:
+                # Handle string device specifications
+                device_name = str(device)
         
         # Load the model
         try:
-            self.model = SentenceTransformer(model_id, trust_remote_code=True)
-            logger.info(f"Initialized Lajavaness Embedding model: {model_id}")
+            # SentenceTransformer takes device name as a string
+            if device_name:
+                logger.info(f"Loading embedding model on device: {device_name}")
+                self.model = SentenceTransformer(model_name, device=device_name, trust_remote_code=True)
+            else:
+                self.model = SentenceTransformer(model_name, trust_remote_code=True)
+            
+            logger.info(f"Initialized Lajavaness Embedding model: {model_name}")
         except Exception as e:
-            logger.error(f"Failed to load embedding model {model_id}: {str(e)}")
+            logger.error(f"Failed to load embedding model {model_name}: {str(e)}")
             raise
     
     def get_embedding(self, text: str, max_retries: int = 3) -> List[float]:

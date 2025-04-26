@@ -63,6 +63,12 @@ def main():
     parser.add_argument("--batch_size", type=int, default=None, help="Batch size (overrides config.yaml batch_size)")
     parser.add_argument("--model_type", type=str, default="base", help="Model type for evaluation mode")
     parser.add_argument("--max_new_tokens", type=int, default=128, help="Maximum new tokens for generation in evaluate mode")
+    parser.add_argument("--multi_gpu", action="store_true", help="Enable multi-GPU training with model parallelism")
+    parser.add_argument("--policy_gpus", type=str, default="0,1", help="Comma-separated list of GPU IDs for policy model")
+    parser.add_argument("--ref_gpus", type=str, default="2,3", help="Comma-separated list of GPU IDs for reference model")
+    parser.add_argument("--reward_gpu", type=int, default=4, help="GPU ID for reward model")
+    parser.add_argument("--embedding_gpu", type=int, default=5, help="GPU ID for embedding model")
+    parser.add_argument("--mixed_precision", action="store_true", default=True, help="Enable mixed precision training")
     args = parser.parse_args()
     
     # Load configuration
@@ -87,15 +93,50 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info(f"Using device: {device}")
     
+    # Set device and GPU configuration
+    num_gpus = torch.cuda.device_count()
+    if args.multi_gpu and num_gpus > 1:
+        logger.info(f"Multi-GPU training enabled with {num_gpus} GPUs available")
+        
+        # Parse GPU ID lists
+        policy_gpus = [int(gpu) for gpu in args.policy_gpus.split(',')]
+        ref_gpus = [int(gpu) for gpu in args.ref_gpus.split(',')]
+        reward_gpu = args.reward_gpu
+        embedding_gpu = args.embedding_gpu
+        
+        # Validate GPU IDs
+        all_gpus = policy_gpus + ref_gpus + [reward_gpu, embedding_gpu]
+        for gpu in all_gpus:
+            if gpu >= num_gpus:
+                logger.warning(f"GPU ID {gpu} is not available (only {num_gpus} GPUs found). Adjusting to use available GPUs.")
+                # Will be auto-adjusted by the trainer
+        
+        # Log GPU allocation strategy
+        logger.info(f"GPU Allocation Strategy:")
+        logger.info(f"  Policy Model: GPUs {policy_gpus}")
+        logger.info(f"  Reference Model: GPUs {ref_gpus}")
+        logger.info(f"  Reward Model: GPU {reward_gpu}")
+        logger.info(f"  Embedding Model: GPU {embedding_gpu}")
+        logger.info(f"  Mixed Precision: {args.mixed_precision}")
+    else:
+        policy_gpus = [0]
+        ref_gpus = [0]
+        reward_gpu = 0
+        embedding_gpu = 0
+        logger.info(f"Using single GPU mode on device: {device}")
+    
     # Initialize QRM-Llama3.1-8B-v2 Reward model from Hugging Face
     reward_model = QRMRewardModel(
         model_id=config.get("qrm_reward", {}).get("model_id", "nicolinho/QRM-Llama3.1-8B-v2"),
         device=device
     )
     
-    # Initialize Lajavaness Embedding
+    # Initialize embedding model for semantic similarity on dedicated GPU
+    embedding_device = torch.device(f"cuda:{embedding_gpu}" if torch.cuda.is_available() else "cpu")
+    logger.info(f"Loading embedding model on {embedding_device}")
     embedding_model = LajavanessEmbedding(
-        model_id=config["embedding"]["model_id"]
+        model_name=config["reward_model"]["embedding_model"],
+        device=embedding_device
     )
     
     if args.mode == "predict":
@@ -129,23 +170,33 @@ def main():
         )
         
         # Set up checkpoint and output directories
-        checkpoint_dir = os.path.join("models", "ppo_checkpoints", f"run_{time.strftime('%Y%m%d_%H%M%S')}")
-        output_dir = args.output_dir or os.path.join("models", f"ppo_finetuned_{time.strftime('%Y%m%d_%H%M%S')}")
-        
-        # Log checkpoint configuration
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        checkpoint_dir = os.path.join("models", "ppo_checkpoints", f"run_{timestamp}")
+        output_dir = os.path.join("models", f"ppo_finetuned_{timestamp}")
         logger.info(f"Checkpoints will be saved to: {checkpoint_dir}")
         logger.info(f"Final model will be saved to: {output_dir}")
         
-        # Use model from config
-        logger.info(f"Using model path from config: {config['rlhf']['ppo']['model_name']}")
-            
-        # Use Hugging Face's PPO Trainer implementation
-        logger.info("Using HuggingFace's PPO implementation")
+        # Get model path from config
+        model_path = config["model"]["model_path"]
+        logger.info(f"Using model path from config: {model_path}")
+        
+        # Add mixed precision setting to config
+        if "mixed_precision" not in config["rlhf"]["ppo"]:
+            config["rlhf"]["ppo"]["mixed_precision"] = args.mixed_precision
+        
+        # Initialize the PPO trainer with model parallelism support
+        logger.info("Using HuggingFace's PPO implementation with model parallelism")
+        primary_device = torch.device(f"cuda:{policy_gpus[0]}" if torch.cuda.is_available() else "cpu")
+        
         ppo_trainer = HuggingFacePPOTrainer(
             config=config,
             reward_predictor=predictor,
-            device=device,
-            checkpoint_dir=checkpoint_dir
+            checkpoint_dir=checkpoint_dir,
+            device=primary_device,
+            policy_model_devices=policy_gpus,
+            ref_model_devices=ref_gpus,
+            reward_model_device=reward_gpu,
+            embedding_device=embedding_gpu
         )
         
         # Load and process SHP dataset using the processors.py
