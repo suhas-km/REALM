@@ -177,7 +177,7 @@ def main():
         logger.info(f"Final model will be saved to: {output_dir}")
         
         # Get model path from config
-        model_path = config["model"]["model_path"]
+        model_path = config["rlhf"]["ppo"]["model_name"]
         logger.info(f"Using model path from config: {model_path}")
         
         # Add mixed precision setting to config
