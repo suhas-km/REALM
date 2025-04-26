@@ -205,7 +205,7 @@ class CustomPPO:
                 
                 try:
                     # Use mixed precision for inference with modern API
-                    with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
+                    with torch.cuda.amp.autocast(dtype=torch.float16):
                         # Run forward pass
                         outputs = model(
                             input_ids=chunk_input_ids,
@@ -519,8 +519,8 @@ class HuggingFacePPOTrainer:
         
         # Enable mixed precision training
         self.use_mixed_precision = config["rlhf"]["ppo"].get("mixed_precision", True)
-        # Use the new PyTorch 2.0+ API for mixed precision
-        self.scaler = torch.amp.GradScaler(device_type='cuda') if self.use_mixed_precision else None
+        # Use the API compatible with installed PyTorch version
+        self.scaler = torch.cuda.amp.GradScaler() if self.use_mixed_precision else None
         
         # Load tokenizer and model
         model_name = config["rlhf"]["ppo"]["model_name"]
@@ -667,7 +667,7 @@ class HuggingFacePPOTrainer:
             
             # Compute rewards for this chunk
             try:
-                with torch.amp.autocast(device_type='cuda', dtype=torch.float16, enabled=self.use_mixed_precision):
+                with torch.cuda.amp.autocast(dtype=torch.float16, enabled=self.use_mixed_precision):
                     chunk_rewards = self.reward_predictor.get_reward_batch(chunk_prompts, chunk_responses)
                 all_rewards.extend(chunk_rewards)
                 logger.info(f"Processed reward chunk {i//chunk_size + 1}/{(len(prompts)+chunk_size-1)//chunk_size} with mean reward: {np.mean(chunk_rewards):.4f}")
@@ -745,7 +745,7 @@ class HuggingFacePPOTrainer:
                 chunk_response_mask = chunk_response_mask.to(self.device)
                 
                 # Use modern mixed precision API
-                with torch.amp.autocast(device_type='cuda', dtype=torch.float16, enabled=self.use_mixed_precision):
+                with torch.cuda.amp.autocast(dtype=torch.float16, enabled=self.use_mixed_precision):
                     # Make sure gradient checkpointing is enabled
                     if not getattr(self.model, 'gradient_checkpointing', False):
                         try:
