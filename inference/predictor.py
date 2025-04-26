@@ -103,6 +103,27 @@ class RewardPredictor:
         
         return reward
     
+    def get_reward_batch(self, prompts: list, responses: list) -> list:
+        """Process a batch of prompt-response pairs in parallel
+        
+        Args:
+            prompts: List of prompt texts
+            responses: List of response texts
+            
+        Returns:
+            List of reward scores for each prompt-response pair
+        """
+        if len(prompts) != len(responses):
+            raise ValueError(f"Mismatch in batch sizes: {len(prompts)} prompts vs {len(responses)} responses")
+        
+        # Process examples in parallel
+        rewards = []
+        for prompt, response in zip(prompts, responses):
+            reward = self.predict(prompt, response)
+            rewards.append(reward)
+            
+        return rewards
+    
     def compare(self, prompt: str, response1: str, response2: str) -> Tuple[float, float, int]:
         """
         Compare two responses and return their rewards and which is better

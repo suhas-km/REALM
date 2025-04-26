@@ -5,6 +5,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import logging
 import time
+import random
 import numpy as np
 from typing import Dict, List, Optional, Tuple, Union
 from transformers import AutoTokenizer, AutoModelForCausalLM
@@ -580,26 +581,58 @@ class HuggingFacePPOTrainer:
     def _compute_rewards(self, prompts: List[str], responses: List[str]):
         """Compute rewards for prompt-response pairs using harmonic blend"""
         # Move reward prediction to dedicated device if available
-        original_device = self.reward_predictor.device
+        original_device = None
         if self.use_distributed and hasattr(self.reward_predictor, 'device'):
+            original_device = self.reward_predictor.device
             reward_device = f"cuda:{self.reward_model_device}"
-            logger.debug(f"Moving reward model computation to {reward_device}")
+            logger.info(f"Moving reward model computation to dedicated GPU: {reward_device}")
             self.reward_predictor.device = torch.device(reward_device)
+            
+            # Also move the underlying models to the dedicated device
+            if hasattr(self.reward_predictor.reward_model, 'device'):
+                self.reward_predictor.reward_model.device = torch.device(reward_device)
+            if hasattr(self.reward_predictor.embedding_model, 'device'):
+                self.reward_predictor.embedding_model.device = torch.device(reward_device)
         
-        # Process in chunks to reduce memory usage
+        # Process in chunks for memory efficiency
         chunk_size = min(len(prompts), 4)  # Process max 4 prompt-response pairs at a time
         all_rewards = []
+        
+        logger.info(f"Computing rewards for {len(prompts)} examples with chunk size {chunk_size}")
         
         for i in range(0, len(prompts), chunk_size):
             chunk_prompts = prompts[i:i+chunk_size]
             chunk_responses = responses[i:i+chunk_size]
             
-            chunk_rewards = self.reward_predictor.get_reward_batch(chunk_prompts, chunk_responses)
-            all_rewards.extend(chunk_rewards)
+            # Compute rewards for this chunk
+            try:
+                with torch.cuda.amp.autocast(dtype=torch.float16, enabled=self.use_mixed_precision):
+                    chunk_rewards = self.reward_predictor.get_reward_batch(chunk_prompts, chunk_responses)
+                all_rewards.extend(chunk_rewards)
+                logger.info(f"Processed reward chunk {i//chunk_size + 1}/{(len(prompts)+chunk_size-1)//chunk_size} with mean reward: {np.mean(chunk_rewards):.4f}")
+            except Exception as e:
+                logger.error(f"Error computing rewards for chunk {i//chunk_size + 1}: {e}")
+                # Fallback to individual computation
+                chunk_rewards = []
+                for prompt, response in zip(chunk_prompts, chunk_responses):
+                    try:
+                        reward = self.reward_predictor.predict(prompt, response)
+                        chunk_rewards.append(reward)
+                    except Exception as inner_e:
+                        logger.error(f"Error computing individual reward: {inner_e}")
+                        chunk_rewards.append(0.0)  # Fallback value
+                all_rewards.extend(chunk_rewards)
+            
+            # Explicitly free memory
+            torch.cuda.empty_cache()
         
         # Restore original device
-        if self.use_distributed and hasattr(self.reward_predictor, 'device'):
+        if original_device is not None:
             self.reward_predictor.device = original_device
+            if hasattr(self.reward_predictor.reward_model, 'device'):
+                self.reward_predictor.reward_model.device = original_device
+            if hasattr(self.reward_predictor.embedding_model, 'device'):
+                self.reward_predictor.embedding_model.device = original_device
         
         rewards_tensor = torch.tensor(all_rewards, dtype=torch.float32).to(self.device)
         return rewards_tensor
