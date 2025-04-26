@@ -135,7 +135,7 @@ def main():
     embedding_device = torch.device(f"cuda:{embedding_gpu}" if torch.cuda.is_available() else "cpu")
     logger.info(f"Loading embedding model on {embedding_device}")
     embedding_model = LajavanessEmbedding(
-        model_name=config["reward_model"]["embedding_model"],
+        model_name=config["embedding"]["model_id"],
         device=embedding_device
     )
     
