@@ -86,6 +86,21 @@ class QRMRewardModel:
         ]
         return messages
     
+    def to(self, device):
+        """Move the model to a different device properly
+        
+        Args:
+            device: The device to move to, e.g., 'cuda:0', 'cuda:1', etc.
+        """
+        logger.info(f"Moving QRM reward model from {self.device} to {device}")
+        self.device = device
+        
+        # Move the model to the specified device
+        if hasattr(self, 'model'):
+            self.model = self.model.to(device)
+        
+        return self
+            
     def get_reward_score(self, prompt: str, response: str) -> float:
         """
         Get reward score for a prompt-response pair.
@@ -101,17 +116,33 @@ class QRMRewardModel:
             # Format into messages
             messages = self.format_prompt(prompt, response)
             
-            # Apply tokenization
+            # Ensure model is on the right device and in eval mode
+            self.model.eval()
+            device_str = str(self.device)
+            
+            # Get actual device of model parameters
+            for param in self.model.parameters():
+                if param.device != self.device:
+                    logger.warning(f"Moving model from {param.device} to {device_str}")
+                    self.model = self.model.to(self.device)
+                break
+            
+            # Apply tokenization and make sure it's on the right device 
             input_ids = self.tokenizer.apply_chat_template(
                 messages, 
                 return_tensors="pt"
-            ).to(self.device)
+            )
             
-            # Get reward prediction
+            # Double check device before inference
+            input_ids = input_ids.to(self.device)
+            
+            # Get reward prediction with explicit device management
             with torch.no_grad():
-                output = self.model(input_ids)
-                # Get the expected reward value
-                reward = output.score.cpu().float().item()
+                # Force all computation to happen on the specified device
+                with torch.device(self.device):
+                    output = self.model(input_ids)
+                    # Make sure to fetch from the same device
+                    reward = output.score.detach().cpu().float().item()
             
             logger.debug(f"QRM reward score: {reward}")
             return reward

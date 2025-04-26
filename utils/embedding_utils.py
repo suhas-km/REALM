@@ -50,6 +50,42 @@ class LajavanessEmbedding:
             logger.error(f"Failed to load embedding model {model_name}: {str(e)}")
             raise
     
+    def to(self, device):
+        """Move the embedding model to the specified device
+        
+        Args:
+            device: The device to move to (string or torch.device)
+            
+        Returns:
+            self for method chaining
+        """
+        # Convert to string if it's a torch.device
+        if hasattr(device, 'type') and hasattr(device, 'index'):
+            if device.type == 'cuda':
+                device_str = f"cuda:{device.index}" if device.index is not None else "cuda:0"
+            else:
+                device_str = str(device)
+        else:
+            device_str = str(device)
+            
+        logger.info(f"Moving embedding model from {self.device} to {device_str}")
+        
+        # Save current device for logging
+        old_device = self.device
+        self.device = device
+        
+        try:
+            # Create a new model instance on the desired device
+            # Unfortunately SentenceTransformer doesn't have a clean way to move models after init
+            self.model = SentenceTransformer(self.model_id, device=device_str, trust_remote_code=True)
+            logger.info(f"Successfully moved embedding model from {old_device} to {device_str}")
+        except Exception as e:
+            logger.error(f"Failed to move embedding model to {device_str}: {str(e)}")
+            # Revert to previous device if it fails
+            self.device = old_device
+            
+        return self
+    
     def get_embedding(self, text: str, max_retries: int = 3) -> List[float]:
         """Get embedding for text using Lajavaness model"""
         retries = 0

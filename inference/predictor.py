@@ -53,6 +53,46 @@ class RewardPredictor:
         self.alpha = alpha
         
         logger.info(f"Reward predictor initialized with harmonic blend (alpha={self.alpha})")
+        
+    def to(self, device):
+        """Move all models to the specified device
+        
+        Args:
+            device: The device to move models to (can be string or torch.device)
+            
+        Returns:
+            self for method chaining
+        """
+        logger.info(f"Moving RewardPredictor from {self.device} to {device}")
+        
+        # Convert string to torch.device if needed
+        if isinstance(device, str):
+            device = torch.device(device)
+            
+        # Update the device attribute
+        self.device = device
+        
+        # Move the reward model if it has a to() method
+        if hasattr(self.reward_model, 'to'):
+            try:
+                self.reward_model.to(device)
+                logger.info(f"Successfully moved reward model to {device}")
+            except Exception as e:
+                logger.error(f"Failed to move reward model to {device}: {e}")
+        
+        # Move the embedding model if it has a to() method
+        if hasattr(self.embedding_model, 'to'):
+            try:
+                self.embedding_model.to(device)
+                logger.info(f"Successfully moved embedding model to {device}")
+            except Exception as e:
+                logger.error(f"Failed to move embedding model to {device}: {e}")
+        
+        # Clear caches after changing device
+        self.llama_score_cache = {}
+        self.embedding_cache = {}
+        
+        return self
     
     def _get_llama_score(self, prompt: str, response: str) -> float:
         """Get Llama reward score with caching"""

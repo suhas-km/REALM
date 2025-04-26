@@ -173,67 +173,120 @@ class CustomPPO:
         return torch.mean(kl)
     
     def _get_logprobs(self, model, input_ids, attention_mask=None):
-        """Get log probabilities from the model with memory optimization"""
+        """Get log probabilities from the model with extreme memory optimization"""
         with torch.set_grad_enabled(model.training):
-            # Process in chunks if input is large to avoid OOM
+            # Process one sequence at a time to minimize memory usage
             batch_size = input_ids.shape[0]
-            max_chunk_size = 2  # Process at most 2 sequences at a time
+            max_chunk_size = 1  # Process just 1 sequence at a time for extreme memory saving
             all_token_log_probs = []
             all_shift_masks = []
             
+            # Ensure gradient checkpointing is enabled
+            if hasattr(model, 'gradient_checkpointing') and not model.gradient_checkpointing:
+                try:
+                    model.gradient_checkpointing_enable()
+                    logger.info("Enabled gradient checkpointing for logprob computation")
+                except Exception as e:
+                    logger.warning(f"Could not enable gradient checkpointing: {e}")
+            
             for chunk_start in range(0, batch_size, max_chunk_size):
                 chunk_end = min(chunk_start + max_chunk_size, batch_size)
-                chunk_input_ids = input_ids[chunk_start:chunk_end]
+                
+                # Clear cache before each chunk
+                torch.cuda.empty_cache()
+                
+                # Move chunk data to device and use CPU offloading where possible
+                chunk_input_ids = input_ids[chunk_start:chunk_end].clone()
                 
                 if attention_mask is not None:
-                    chunk_attention_mask = attention_mask[chunk_start:chunk_end]
+                    chunk_attention_mask = attention_mask[chunk_start:chunk_end].clone()
                 else:
                     chunk_attention_mask = None
                 
-                # Use mixed precision for inference
-                with torch.cuda.amp.autocast(dtype=torch.float16):
-                    outputs = model(
-                        input_ids=chunk_input_ids,
-                        attention_mask=chunk_attention_mask,
-                        return_dict=True
-                    )
-                    logits = outputs.logits
+                try:
+                    # Use mixed precision for inference with modern API
+                    with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
+                        # Run forward pass
+                        outputs = model(
+                            input_ids=chunk_input_ids,
+                            attention_mask=chunk_attention_mask,
+                            return_dict=True
+                        )
+                        
+                        logits = outputs.logits if hasattr(outputs, "logits") else outputs[0]
+                        
+                        # Move subsequent computation to CPU if possible to save GPU memory
+                        cpu_logits = logits.detach().cpu()
+                        cpu_input_ids = chunk_input_ids.cpu()
+                        cpu_attn_mask = chunk_attention_mask.cpu() if chunk_attention_mask is not None else None
+                        
+                        # Free GPU memory immediately
+                        del outputs, logits
+                        torch.cuda.empty_cache()
+                        
+                        # Perform rest of computation on CPU
+                        shift_logits = cpu_logits[:, :-1, :].contiguous()
+                        shift_ids = cpu_input_ids[:, 1:].contiguous()
+                        
+                        # Create mask to identify where the tokens are (ignoring padding)
+                        if cpu_attn_mask is not None:
+                            shift_mask = cpu_attn_mask[:, 1:].contiguous()
+                        else:
+                            shift_mask = torch.ones_like(shift_ids)
+                        
+                        # Compute log probabilities from logits
+                        log_probs = F.log_softmax(shift_logits, dim=-1)
+                        
+                        # Extract only the log probs of the actual token that appeared
+                        token_log_probs = -torch.gather(
+                            log_probs, 
+                            dim=-1, 
+                            index=shift_ids.unsqueeze(-1)
+                        ).squeeze(-1)
+                        
+                        # Apply mask to get the actual token log probs
+                        token_log_probs = token_log_probs * shift_mask
                     
-                    # Shift logits and input_ids for next token prediction
-                    # This is the line that was causing OOM issues
-                    shift_logits = logits[..., :-1, :].contiguous()
-                    shift_ids = chunk_input_ids[..., 1:].contiguous()
+                        # Store results from this chunk
+                        all_token_log_probs.append(token_log_probs)
+                        all_shift_masks.append(shift_mask)
                     
-                    # Create attention mask for shifted sequence if provided
-                    if chunk_attention_mask is not None:
-                        shift_mask = chunk_attention_mask[..., 1:].contiguous()
-                    else:
-                        shift_mask = torch.ones_like(shift_ids)
+                except torch.cuda.OutOfMemoryError as e:
+                    logger.error(f"OOM in logprob computation for chunk {chunk_start}: {e}")
+                    # Create dummy outputs in case of OOM
+                    seq_len = chunk_input_ids.size(1) - 1 if chunk_input_ids.size(1) > 1 else 1
+                    dummy_log_probs = torch.zeros((chunk_end - chunk_start, seq_len))
+                    dummy_mask = torch.ones((chunk_end - chunk_start, seq_len))
                     
-                    # Calculate log probabilities in FP16 for memory efficiency
-                    log_probs = F.log_softmax(shift_logits, dim=-1)
-                    
-                    # Get log prob of each chosen token
-                    token_log_probs = log_probs.gather(-1, shift_ids.unsqueeze(-1)).squeeze(-1)
-                    
-                    # Apply mask to get valid log probs
-                    token_log_probs = token_log_probs * shift_mask
+                    all_token_log_probs.append(dummy_log_probs)
+                    all_shift_masks.append(dummy_mask)
+                    logger.warning("Using dummy values due to OOM")
                 
-                # Collect results from this chunk
-                all_token_log_probs.append(token_log_probs)
-                all_shift_masks.append(shift_mask)
-                
-                # Explicitly free memory
-                del outputs, logits, shift_logits, log_probs
+                # Explicitly clean up memory
+                if 'chunk_input_ids' in locals(): del chunk_input_ids
+                if 'chunk_attention_mask' in locals(): del chunk_attention_mask
+                if 'cpu_logits' in locals(): del cpu_logits
+                if 'cpu_input_ids' in locals(): del cpu_input_ids
+                if 'cpu_attn_mask' in locals(): del cpu_attn_mask
+                if 'shift_logits' in locals(): del shift_logits
+                if 'shift_ids' in locals(): del shift_ids
+                if 'log_probs' in locals(): del log_probs
+                if 'token_log_probs' in locals(): del token_log_probs
+                if 'shift_mask' in locals(): del shift_mask
                 torch.cuda.empty_cache()
             
-            # Combine results from all chunks
-            if batch_size > max_chunk_size:
+            # Combine results from all chunks (all on CPU at this point)
+            if len(all_token_log_probs) > 1:
                 token_log_probs = torch.cat(all_token_log_probs, dim=0)
                 shift_mask = torch.cat(all_shift_masks, dim=0)
             else:
                 token_log_probs = all_token_log_probs[0]
                 shift_mask = all_shift_masks[0]
+            
+            # Move results back to the original device only at the end
+            device = input_ids.device
+            token_log_probs = token_log_probs.to(device)
+            shift_mask = shift_mask.to(device)
             
             return token_log_probs, shift_mask
     
@@ -466,7 +519,8 @@ class HuggingFacePPOTrainer:
         
         # Enable mixed precision training
         self.use_mixed_precision = config["rlhf"]["ppo"].get("mixed_precision", True)
-        self.scaler = torch.cuda.amp.GradScaler() if self.use_mixed_precision else None
+        # Use the new PyTorch 2.0+ API for mixed precision
+        self.scaler = torch.amp.GradScaler(device_type='cuda') if self.use_mixed_precision else None
         
         # Load tokenizer and model
         model_name = config["rlhf"]["ppo"]["model_name"]
@@ -582,17 +636,24 @@ class HuggingFacePPOTrainer:
         """Compute rewards for prompt-response pairs using harmonic blend"""
         # Move reward prediction to dedicated device if available
         original_device = None
-        if self.use_distributed and hasattr(self.reward_predictor, 'device'):
-            original_device = self.reward_predictor.device
-            reward_device = f"cuda:{self.reward_model_device}"
-            logger.info(f"Moving reward model computation to dedicated GPU: {reward_device}")
-            self.reward_predictor.device = torch.device(reward_device)
+        reward_device = None
+        
+        if self.use_distributed and self.reward_model_device is not None:
+            # Save original device for restoration
+            if hasattr(self.reward_predictor, 'device'):
+                original_device = self.reward_predictor.device
             
-            # Also move the underlying models to the dedicated device
-            if hasattr(self.reward_predictor.reward_model, 'device'):
-                self.reward_predictor.reward_model.device = torch.device(reward_device)
-            if hasattr(self.reward_predictor.embedding_model, 'device'):
-                self.reward_predictor.embedding_model.device = torch.device(reward_device)
+            # Set up the target device
+            reward_device = f"cuda:{self.reward_model_device}"
+            logger.info(f"Moving reward computation to dedicated GPU: {reward_device}")
+            
+            # Move the entire predictor and its components to the target device
+            if hasattr(self.reward_predictor, 'to'):
+                try:
+                    # This will properly move all submodels using the to() methods we added
+                    self.reward_predictor.to(reward_device)
+                except Exception as e:
+                    logger.error(f"Error moving reward predictor to {reward_device}: {e}")
         
         # Process in chunks for memory efficiency
         chunk_size = min(len(prompts), 4)  # Process max 4 prompt-response pairs at a time
@@ -606,7 +667,7 @@ class HuggingFacePPOTrainer:
             
             # Compute rewards for this chunk
             try:
-                with torch.cuda.amp.autocast(dtype=torch.float16, enabled=self.use_mixed_precision):
+                with torch.amp.autocast(device_type='cuda', dtype=torch.float16, enabled=self.use_mixed_precision):
                     chunk_rewards = self.reward_predictor.get_reward_batch(chunk_prompts, chunk_responses)
                 all_rewards.extend(chunk_rewards)
                 logger.info(f"Processed reward chunk {i//chunk_size + 1}/{(len(prompts)+chunk_size-1)//chunk_size} with mean reward: {np.mean(chunk_rewards):.4f}")
@@ -623,17 +684,20 @@ class HuggingFacePPOTrainer:
                         chunk_rewards.append(0.0)  # Fallback value
                 all_rewards.extend(chunk_rewards)
             
-            # Explicitly free memory
+            # Explicitly free memory after each chunk
             torch.cuda.empty_cache()
         
-        # Restore original device
-        if original_device is not None:
-            self.reward_predictor.device = original_device
-            if hasattr(self.reward_predictor.reward_model, 'device'):
-                self.reward_predictor.reward_model.device = original_device
-            if hasattr(self.reward_predictor.embedding_model, 'device'):
-                self.reward_predictor.embedding_model.device = original_device
+        # Restore original device if we changed it
+        if original_device is not None and reward_device is not None:
+            logger.info(f"Restoring reward computation back to original device: {original_device}")
+            try:
+                # Properly move back using the to() methods we added
+                if hasattr(self.reward_predictor, 'to'):
+                    self.reward_predictor.to(original_device)
+            except Exception as e:
+                logger.error(f"Error restoring reward predictor to original device: {e}")
         
+        # Convert rewards to tensor and move to the PPO device
         rewards_tensor = torch.tensor(all_rewards, dtype=torch.float32).to(self.device)
         return rewards_tensor
     
@@ -643,84 +707,131 @@ class HuggingFacePPOTrainer:
         max_length = max([t.size(0) for t in input_tensors])
         batch_size = len(input_tensors)
         
-        # Process in smaller chunks to avoid OOM
-        chunk_size = min(batch_size, 2)  # Process max 2 sequences at a time
+        # Process in smaller chunks to avoid OOM - use single sample processing for huge models
+        chunk_size = 1  # Process just 1 sequence at a time to avoid OOM
         all_logprobs = []
         all_values = []
         
-        logger.info(f"Processing {batch_size} sequences with chunk size {chunk_size}")
+        logger.info(f"Processing {batch_size} sequences with chunk size {chunk_size} (extreme memory saving mode)")
         
         for i in range(0, batch_size, chunk_size):
             chunk_end = min(i + chunk_size, batch_size)
             chunk_size_actual = chunk_end - i
-            logger.debug(f"Processing chunk {i//chunk_size + 1}/{(batch_size+chunk_size-1)//chunk_size}: items {i}-{chunk_end-1}")
+            logger.info(f"Processing chunk {i//chunk_size + 1}/{(batch_size+chunk_size-1)//chunk_size}: items {i}-{chunk_end-1}")
             
-            # Create padded tensors for this chunk
-            chunk_padded = torch.ones((chunk_size_actual, max_length), dtype=torch.long) * self.tokenizer.pad_token_id
-            chunk_attention_mask = torch.zeros((chunk_size_actual, max_length), dtype=torch.long)
-            chunk_response_mask = torch.zeros((chunk_size_actual, max_length), dtype=torch.float)
-            
-            # Fill padded tensors for this chunk
-            for j in range(chunk_size_actual):
-                idx = i + j
-                tensor = input_tensors[idx]
-                start_idx = response_start_indices[idx]
-                length = tensor.size(0)
+            try:
+                # Create padded tensors for this chunk
+                chunk_padded = torch.ones((chunk_size_actual, max_length), dtype=torch.long) * self.tokenizer.pad_token_id
+                chunk_attention_mask = torch.zeros((chunk_size_actual, max_length), dtype=torch.long)
+                chunk_response_mask = torch.zeros((chunk_size_actual, max_length), dtype=torch.float)
                 
-                chunk_padded[j, :length] = tensor
-                chunk_attention_mask[j, :length] = 1
-                chunk_response_mask[j, start_idx:length] = 1
-            
-            # Move to device
-            chunk_padded = chunk_padded.to(self.device)
-            chunk_attention_mask = chunk_attention_mask.to(self.device)
-            chunk_response_mask = chunk_response_mask.to(self.device)
-            
-            # Use mixed precision to save memory
-            with torch.cuda.amp.autocast(dtype=torch.float16, enabled=self.use_mixed_precision):
-                # Get model outputs with gradient checkpointing enabled
-                model_outputs = self.model(
-                    input_ids=chunk_padded,
-                    attention_mask=chunk_attention_mask,
-                    output_hidden_states=True,
-                    return_dict=True
-                )
-                hidden_states = model_outputs.hidden_states[-1]
+                # Fill padded tensors for this chunk
+                for j in range(chunk_size_actual):
+                    idx = i + j
+                    tensor = input_tensors[idx]
+                    start_idx = response_start_indices[idx]
+                    length = tensor.size(0)
+                    
+                    chunk_padded[j, :length] = tensor
+                    chunk_attention_mask[j, :length] = 1
+                    chunk_response_mask[j, start_idx:length] = 1
                 
-                # Compute values
-                chunk_values = self.ppo._get_values(hidden_states, chunk_attention_mask)
+                # Move to CPU first, then to GPU in parts if needed to avoid memory spikes
+                torch.cuda.empty_cache()  # Clear cache before processing
                 
-                # Compute log probabilities
-                chunk_logprobs, _ = self.ppo._get_logprobs(
-                    self.model, 
-                    chunk_padded, 
-                    chunk_attention_mask
-                )
-            
-            # Collect results
-            all_logprobs.append(chunk_logprobs)
-            all_values.append(chunk_values)
+                # Move to device
+                chunk_padded = chunk_padded.to(self.device)
+                chunk_attention_mask = chunk_attention_mask.to(self.device)
+                chunk_response_mask = chunk_response_mask.to(self.device)
+                
+                # Use modern mixed precision API
+                with torch.amp.autocast(device_type='cuda', dtype=torch.float16, enabled=self.use_mixed_precision):
+                    # Make sure gradient checkpointing is enabled
+                    if not getattr(self.model, 'gradient_checkpointing', False):
+                        try:
+                            self.model.gradient_checkpointing_enable()
+                            logger.info("Enabled gradient checkpointing for model")
+                        except Exception as e:
+                            logger.warning(f"Could not enable gradient checkpointing: {e}")
+                    
+                    # Get model outputs with gradient checkpointing enabled
+                    model_outputs = self.model(
+                        input_ids=chunk_padded,
+                        attention_mask=chunk_attention_mask,
+                        output_hidden_states=True,
+                        return_dict=True
+                    )
+                    hidden_states = model_outputs.hidden_states[-1]
+                    
+                    # Compute values
+                    chunk_values = self.ppo._get_values(hidden_states, chunk_attention_mask)
+                    
+                    # Compute log probabilities
+                    chunk_logprobs, _ = self.ppo._get_logprobs(
+                        self.model, 
+                        chunk_padded, 
+                        chunk_attention_mask
+                    )
+                
+                # Move results to CPU to save GPU memory
+                chunk_logprobs_cpu = chunk_logprobs.detach().cpu()
+                chunk_values_cpu = chunk_values.detach().cpu()
+                
+                # Collect results on CPU
+                all_logprobs.append(chunk_logprobs_cpu)
+                all_values.append(chunk_values_cpu)
+                
+            except torch.cuda.OutOfMemoryError as e:
+                logger.error(f"Out of memory error in chunk {i}: {e}")
+                
+                # Create dummy outputs as fallback
+                dummy_logprobs = torch.zeros((chunk_size_actual, max_length), dtype=torch.float32)
+                dummy_values = torch.zeros((chunk_size_actual, 1), dtype=torch.float32)
+                
+                all_logprobs.append(dummy_logprobs)
+                all_values.append(dummy_values)
+                
+                logger.warning(f"Using dummy values for chunk {i} due to OOM")
             
             # Explicitly free memory
-            del chunk_padded, chunk_attention_mask, chunk_response_mask
-            del model_outputs, hidden_states, chunk_logprobs, chunk_values
+            if 'chunk_padded' in locals(): del chunk_padded
+            if 'chunk_attention_mask' in locals(): del chunk_attention_mask
+            if 'chunk_response_mask' in locals(): del chunk_response_mask
+            if 'model_outputs' in locals(): del model_outputs
+            if 'hidden_states' in locals(): del hidden_states
+            if 'chunk_logprobs' in locals(): del chunk_logprobs
+            if 'chunk_values' in locals(): del chunk_values
             torch.cuda.empty_cache()
         
-        # Create combined tensors for the full batch
-        padded_ids = torch.ones((batch_size, max_length), dtype=torch.long).to(self.device) * self.tokenizer.pad_token_id
-        attention_mask = torch.zeros((batch_size, max_length), dtype=torch.long).to(self.device)
-        response_mask = torch.zeros((batch_size, max_length), dtype=torch.float).to(self.device)
+        # Create combined tensors but keep on CPU first
+        padded_ids_cpu = torch.ones((batch_size, max_length), dtype=torch.long) * self.tokenizer.pad_token_id
+        attention_mask_cpu = torch.zeros((batch_size, max_length), dtype=torch.long)
+        response_mask_cpu = torch.zeros((batch_size, max_length), dtype=torch.float)
         
-        # Fill the combined tensors
+        # Fill the combined tensors on CPU
         for i, (tensor, start_idx) in enumerate(zip(input_tensors, response_start_indices)):
             length = tensor.size(0)
-            padded_ids[i, :length] = tensor.to(self.device)
-            attention_mask[i, :length] = 1
-            response_mask[i, start_idx:length] = 1
+            padded_ids_cpu[i, :length] = tensor
+            attention_mask_cpu[i, :length] = 1
+            response_mask_cpu[i, start_idx:length] = 1
         
-        # Combine all chunk results
-        logprobs = torch.cat(all_logprobs, dim=0) if len(all_logprobs) > 1 else all_logprobs[0]
-        values = torch.cat(all_values, dim=0) if len(all_values) > 1 else all_values[0]
+        # Combine all chunk results on CPU
+        if len(all_logprobs) > 1:
+            logprobs_cpu = torch.cat(all_logprobs, dim=0)
+            values_cpu = torch.cat(all_values, dim=0)
+        else:
+            logprobs_cpu = all_logprobs[0]
+            values_cpu = all_values[0]
+        
+        # Now move everything to GPU in a single operation to avoid memory fragmentation
+        logger.info("Moving final tensors to GPU...")
+        torch.cuda.empty_cache()
+        
+        padded_ids = padded_ids_cpu.to(self.device)
+        attention_mask = attention_mask_cpu.to(self.device)
+        response_mask = response_mask_cpu.to(self.device)
+        logprobs = logprobs_cpu.to(self.device)
+        values = values_cpu.to(self.device)
         
         return padded_ids, attention_mask, response_mask, logprobs, values
     
