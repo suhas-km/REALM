@@ -296,27 +296,23 @@ class CustomPPO:
         response_mask: torch.Tensor,
         n_updates: int = 4
     ) -> Dict:
-        """Perform a PPO update on a batch of data"""
-        # Device synchronization to avoid issues
+        """Perform a PPO update on a batch of data with extreme memory optimization"""
+        # Clear CUDA cache before starting
+        torch.cuda.empty_cache()
         torch.cuda.synchronize(self.device)
         
-        # Move everything to the policy model's device
-        input_ids = input_ids.to(self.device)
-        attention_mask = attention_mask.to(self.device)
-        old_logprobs = old_logprobs.to(self.device)
-        old_values = old_values.to(self.device)
-        rewards = rewards.to(self.device)
-        response_mask = response_mask.to(self.device)
+        logger.info(f"PPO train step on {self.device} - optimizing for memory usage")
         
-        # Get current values and logprobs on policy device
-        with torch.no_grad():
-            outputs = self.model(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                output_hidden_states=True,
-                return_dict=True
-            )
-            values = self._get_values(outputs.hidden_states[-1], attention_mask)
+        # Move tensors to CPU first to avoid having duplicates on GPU
+        cpu_input_ids = input_ids.cpu()
+        cpu_attention_mask = attention_mask.cpu()
+        cpu_old_logprobs = old_logprobs.cpu()
+        cpu_old_values = old_values.cpu()
+        cpu_rewards = rewards.cpu()
+        cpu_response_mask = response_mask.cpu()
+        
+        # Clear memory again
+        torch.cuda.empty_cache()
         
         # Get reference model logprobs WITHOUT moving model (compute on ref model's device)
         with torch.no_grad():
@@ -325,60 +321,102 @@ class CustomPPO:
             logger.info(f"Computing reference logprobs on {ref_device}")
             
             # Copy input tensors to ref device
-            ref_input_ids = input_ids.to(ref_device)
-            ref_attention_mask = attention_mask.to(ref_device)
+            ref_input_ids = cpu_input_ids.to(ref_device)
+            ref_attention_mask = cpu_attention_mask.to(ref_device)
             
             # Compute logprobs on ref device
             ref_logprobs, _ = self._get_logprobs(
                 self.ref_model, ref_input_ids, ref_attention_mask
             )
             
-            # Move only the resulting tensor back to policy device
-            ref_logprobs = ref_logprobs.to(self.device)
+            # Move resulting tensor to CPU first to free GPU memory
+            cpu_ref_logprobs = ref_logprobs.cpu()
+            
+            # Clear ref device memory
+            del ref_input_ids, ref_attention_mask, ref_logprobs
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize(ref_device)
+        
+        # Now move necessary tensors to policy device for computation
+        logger.info(f"Moving tensors to policy device {self.device} for computation")
+        device_input_ids = cpu_input_ids.to(self.device)
+        device_attention_mask = cpu_attention_mask.to(self.device)
+        device_old_logprobs = cpu_old_logprobs.to(self.device)
+        device_old_values = cpu_old_values.to(self.device)
+        device_rewards = cpu_rewards.to(self.device)
+        device_response_mask = cpu_response_mask.to(self.device)
+        device_ref_logprobs = cpu_ref_logprobs.to(self.device)
+        
+        # Get current values for advantage calculation (with memory cleanup)
+        with torch.no_grad():
+            # Use gradient checkpointing to save memory
+            if not getattr(self.model, 'gradient_checkpointing', False):
+                if hasattr(self.model, 'gradient_checkpointing_enable'):
+                    self.model.gradient_checkpointing_enable()
+                    logger.info("Enabled gradient checkpointing for train_step")
+            
+            # Forward pass with minimal stored activations
+            outputs = self.model(
+                input_ids=device_input_ids,
+                attention_mask=device_attention_mask,
+                output_hidden_states=True,
+                return_dict=True
+            )
+            hidden_states = outputs.hidden_states[-1]
+            values = self._get_values(hidden_states, device_attention_mask)
+            del outputs, hidden_states  # Free memory
+            torch.cuda.empty_cache()
         
         # All examples are individual sequences, so done is always 1
-        dones = torch.ones_like(rewards)
+        dones = torch.ones_like(device_rewards)
         
         # Calculate returns and advantages
-        returns, advantages = self._calculate_returns_and_advantages(rewards, values, dones)
+        returns, advantages = self._calculate_returns_and_advantages(device_rewards, values, dones)
         
         # Calculate metrics
         value_loss_epoch = 0
         policy_loss_epoch = 0
         kl_epoch = 0
         
-        # Multiple optimization epochs
-        for _ in range(n_updates):
-            # Get current log probabilities
+        # Multiple optimization epochs (with memory cleanup between iterations)
+        for i in range(n_updates):
+            logger.info(f"PPO update {i+1}/{n_updates}")
+            
+            # Free memory before each update
+            torch.cuda.empty_cache()
+            
+            # Get current log probabilities (with minimal memory retention)
             current_logprobs, current_mask = self._get_logprobs(
-                self.model, input_ids, attention_mask
+                self.model, device_input_ids, device_attention_mask
             )
             
             # Calculate masked log probs
-            response_mask_shifted = response_mask[:, 1:]  # Shift to match token predictions
+            response_mask_shifted = device_response_mask[:, 1:]  # Shift to match token predictions
             
             # Calculate policy loss (only for generated tokens, not for prompt)
             policy_loss = self._policy_loss(
                 current_logprobs, 
-                old_logprobs, 
+                device_old_logprobs, 
                 advantages.unsqueeze(1).expand_as(current_logprobs), 
                 response_mask_shifted
             )
             
             # Calculate KL divergence using the pre-computed ref_logprobs
-            kl = self._calculate_kl(current_logprobs, ref_logprobs, current_mask)
+            kl = self._calculate_kl(current_logprobs, device_ref_logprobs, current_mask)
             
-            # Get fresh values
+            # Get fresh values (with memory cleanup)
             outputs = self.model(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
+                input_ids=device_input_ids,
+                attention_mask=device_attention_mask,
                 output_hidden_states=True,
                 return_dict=True
             )
-            current_values = self._get_values(outputs.hidden_states[-1], attention_mask)
+            hidden_states = outputs.hidden_states[-1]
+            current_values = self._get_values(hidden_states, device_attention_mask)
+            del outputs, hidden_states  # Free memory
             
             # Calculate value loss
-            value_loss = self._value_loss(current_values, returns, old_values)
+            value_loss = self._value_loss(current_values, returns, device_old_values)
             
             # Calculate entropy for regularization
             entropy = -torch.mean((torch.exp(current_logprobs) * current_logprobs) * response_mask_shifted)
@@ -396,6 +434,10 @@ class CustomPPO:
             value_loss_epoch += value_loss.item()
             policy_loss_epoch += policy_loss.item()
             kl_epoch += kl.item()
+            
+            # Free temporary tensors
+            del current_logprobs, current_mask, current_values, policy_loss, value_loss, kl, entropy, loss
+            torch.cuda.empty_cache()
         
         # Average metrics
         metrics = {
