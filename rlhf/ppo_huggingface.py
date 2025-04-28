@@ -79,42 +79,17 @@ class CustomPPO:
         self.ref_model = type(self.model)(self.model.config)
         
         # Handle loading state dictionary depending on model type (distributed or not)
-        if hasattr(self.model, 'module'):  # For DeepSpeed or DistributedDataParallel
+        if hasattr(self.model, 'module'):  # For DistributedDataParallel
             self.ref_model.load_state_dict(self.model.module.state_dict())
         else:
             self.ref_model.load_state_dict(self.model.state_dict())
         
-        # Enable memory efficient attention if available
-        if hasattr(self.ref_model.config, 'attn_implementation'):
-            self.ref_model.config.attn_implementation = "flash_attention_2"
-        
-        # Distribute reference model if multiple devices specified
-        if len(self.ref_model_devices) > 1:
-            try:
-                import deepspeed
-                # We don't need optimizer for reference model
-                ds_config = {
-                    "train_batch_size": self.config.get("batch_size", 8),
-                    "fp16": {"enabled": True},
-                    "zero_optimization": {"stage": 3},
-                    "tensor_parallel": {"tp_size": len(self.ref_model_devices)}
-                }
-                self.ref_model, _, _, _ = deepspeed.initialize(
-                    model=self.ref_model,
-                    config=ds_config
-                )
-                logger.info(f"DeepSpeed initialized for reference model across {len(self.ref_model_devices)} GPUs")
-            except ImportError:
-                # Fallback to first reference model device
-                logger.warning("DeepSpeed not found. Moving reference model to a single GPU.")
-                self.ref_model.to(f"cuda:{self.ref_model_devices[0]}")
-        else:
-            # Simply move reference model to the appropriate device
-            if len(self.ref_model_devices) > 0:
-                ref_device = f"cuda:{self.ref_model_devices[0]}"
-                self.ref_model = self.ref_model.to(ref_device)
-                logger.info(f"Moved reference model to {ref_device}")
-            self.ref_model.to(ref_device)
+        # Move reference model to appropriate device
+        if len(self.ref_model_devices) > 0:
+            # Simply move to the first specified device
+            ref_device = f"cuda:{self.ref_model_devices[0]}"
+            self.ref_model = self.ref_model.to(ref_device)
+            logger.info(f"Moved reference model to {ref_device}")
         
         self.ref_model.eval()
         
@@ -322,6 +297,17 @@ class CustomPPO:
         n_updates: int = 4
     ) -> Dict:
         """Perform a PPO update on a batch of data"""
+        # Device synchronization to avoid issues
+        torch.cuda.synchronize(self.device)
+        
+        # Move everything to the policy model's device
+        input_ids = input_ids.to(self.device)
+        attention_mask = attention_mask.to(self.device)
+        old_logprobs = old_logprobs.to(self.device)
+        old_values = old_values.to(self.device)
+        rewards = rewards.to(self.device)
+        response_mask = response_mask.to(self.device)
+        
         # Get current values
         with torch.no_grad():
             outputs = self.model(
@@ -351,10 +337,24 @@ class CustomPPO:
             )
             
             # Get reference log probabilities for KL calculation
-            with torch.no_grad():
-                ref_logprobs, _ = self._get_logprobs(
-                    self.ref_model, input_ids, attention_mask
-                )
+            device_before = next(self.ref_model.parameters()).device
+            if str(device_before) != str(self.device):
+                # Move reference model temporarily to same device to avoid cross-device issues
+                self.ref_model.to(self.device)
+                # Synchronize to ensure device transfer is complete
+                torch.cuda.synchronize(self.device)
+            
+            # Get reference model logprobs
+            ref_logprobs, _ = self._get_logprobs(
+                self.ref_model,
+                input_ids,
+                attention_mask
+            )
+            
+            # Move reference model back if needed
+            if str(device_before) != str(self.device):
+                self.ref_model.to(device_before)
+                torch.cuda.synchronize(device_before)
             
             # Calculate masked log probs
             response_mask_shifted = response_mask[:, 1:]  # Shift to match token predictions
@@ -443,62 +443,28 @@ class HuggingFacePPOTrainer:
         
         # Setup device allocation for multi-GPU training
         self.world_size = torch.cuda.device_count()
-        self.use_distributed = self.world_size > 1
         
-        # Set up device mapping for model parallelism
-        if self.use_distributed:
-            # Default device mapping based on available GPUs
-            self.policy_model_devices = policy_model_devices or [0, 1] 
-            self.ref_model_devices = ref_model_devices or [2, 3]
-            self.reward_model_device = reward_model_device or 4
-            self.embedding_device = embedding_device or 5
-            
-            # Adjust devices if we have fewer GPUs than requested
-            if self.world_size < 6:
-                logger.warning(f"Requested 6 GPUs for optimal distribution but only {self.world_size} available. Adjusting mapping.")
-                if self.world_size >= 3:
-                    # Minimum 3 GPUs - distribute essential models
-                    self.policy_model_devices = [0]
-                    self.ref_model_devices = [1]
-                    self.reward_model_device = 2
-                    self.embedding_device = 2
-                else:
-                    # Fallback to minimal setup
-                    self.policy_model_devices = [0]
-                    self.ref_model_devices = [0]
-                    self.reward_model_device = 0 if self.world_size < 2 else 1
-                    self.embedding_device = 0 if self.world_size < 2 else 1
-        else:
-            # Single GPU setup
-            self.policy_model_devices = [0]
-            self.ref_model_devices = [0]
-            self.reward_model_device = 0
-            self.embedding_device = 0
-            
-        # Set primary device for this trainer
-        self.device = device or torch.device(f"cuda:{self.policy_model_devices[0]}" if torch.cuda.is_available() else "cpu")
+        # Set primary device
+        if device is None:
+            device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+        self.device = device
         logger.info(f"Primary device: {self.device}")
         
-        # Display GPU allocation strategy
-        if self.use_distributed:
-            logger.info("GPU allocation for model parallelism:")
-            logger.info(f"Policy model: GPUs {self.policy_model_devices}")
-            logger.info(f"Reference model: GPUs {self.ref_model_devices}")
-            logger.info(f"Reward model: GPU {self.reward_model_device}")
-            logger.info(f"Embedding model: GPU {self.embedding_device}")
-            
-        self.checkpoint_dir = checkpoint_dir or "./checkpoints"
-        os.makedirs(self.checkpoint_dir, exist_ok=True)
+        # Setup model parallelism
+        self.policy_model_devices = policy_model_devices or [0]
+        self.ref_model_devices = ref_model_devices or [0]
+        self.reward_model_device = reward_model_device
+        self.embedding_device = embedding_device
         
-        # Default hyperparameters
-        self.batch_size = config["rlhf"]["ppo"].get("batch_size", 8)
-        self.max_length = config["rlhf"]["ppo"].get("max_length", 512)
-        self.max_new_tokens = config["rlhf"]["ppo"].get("max_new_tokens", 256)
+        # Log GPU allocation
+        logger.info("GPU allocation for model parallelism:")
+        logger.info(f"Policy model: GPUs {self.policy_model_devices}")
+        logger.info(f"Reference model: GPUs {self.ref_model_devices}")
+        logger.info(f"Reward model: GPU {self.reward_model_device}")
+        logger.info(f"Embedding model: GPU {self.embedding_device}")
         
-        # Enable mixed precision training
-        self.use_mixed_precision = config["rlhf"]["ppo"].get("mixed_precision", True)
-        # Use the API compatible with installed PyTorch version
-        self.scaler = torch.amp.GradScaler('cuda') if self.use_mixed_precision else None
+        # Disable distributed training completely
+        self.use_distributed = False
         
         # Load tokenizer and model
         model_name = config["rlhf"]["ppo"]["model_name"]
@@ -612,30 +578,21 @@ class HuggingFacePPOTrainer:
     
     def _compute_rewards(self, prompts: List[str], responses: List[str]):
         """Compute rewards for prompt-response pairs using harmonic blend"""
-        # Disable distributed training since it's causing issues
-        self.use_distributed = False
-        logger.info("Distributed training disabled to avoid DeepSpeed issues")
-        
-        # Move reward prediction to dedicated device if available
-        original_device = None
-        reward_device = None
-        
-        if self.use_distributed and self.reward_model_device is not None:
-            # Save original device for restoration
-            if hasattr(self.reward_predictor, 'device'):
-                original_device = self.reward_predictor.device
-            
-            # Set up the target device
+        # Move reward model to specified device
+        if self.reward_model_device is not None:
             reward_device = f"cuda:{self.reward_model_device}"
             logger.info(f"Moving reward computation to dedicated GPU: {reward_device}")
             
-            # Move the entire predictor and its components to the target device
-            if hasattr(self.reward_predictor, 'to'):
-                try:
-                    # This will properly move all submodels using the to() methods we added
+            try:
+                if hasattr(self.reward_predictor, 'to'):
+                    # Save original device to restore later
+                    original_device = self.reward_predictor.device if hasattr(self.reward_predictor, 'device') else None
                     self.reward_predictor.to(reward_device)
-                except Exception as e:
-                    logger.error(f"Error moving reward predictor to {reward_device}: {e}")
+                    
+                    # Synchronize to ensure device transfer is complete
+                    torch.cuda.synchronize(reward_device)
+            except Exception as e:
+                logger.error(f"Failed to move reward model to dedicated device: {e}")
         
         # Process in chunks for memory efficiency
         chunk_size = min(len(prompts), 4)  # Process max 4 prompt-response pairs at a time
@@ -653,8 +610,8 @@ class HuggingFacePPOTrainer:
                     chunk_rewards = []
                     for p, r in zip(chunk_prompts, chunk_responses):
                         try:
-                            # Get reward score using harmonic blend
-                            reward = self.reward_predictor.get_reward_score(p, r)
+                            # Get reward score using harmonic blend with the correct method name
+                            reward = self.reward_predictor.predict(p, r)
                             chunk_rewards.append(reward)
                         except Exception as e:
                             logger.error(f"Error getting reward score: {e}")
@@ -810,12 +767,28 @@ class HuggingFacePPOTrainer:
         # Create combined tensors but keep on CPU first
         max_size = max([tensor.size(1) for tensor in all_logprobs if tensor.numel() > 0]) if all_logprobs else 0
         
-        # Make sure all logprobs have the same size in dimension 1
+        # Make sure all tensors have the same size in dimension 1
         if max_size > 0:
             for i in range(len(all_logprobs)):
                 if all_logprobs[i].numel() > 0 and all_logprobs[i].size(1) < max_size:
                     pad_size = max_size - all_logprobs[i].size(1)
                     all_logprobs[i] = torch.nn.functional.pad(all_logprobs[i], (0, pad_size), 'constant', 0)
+            
+            # Ensure all other tensors match in size too
+            for i in range(len(all_padded_ids)):
+                if all_padded_ids[i].numel() > 0 and all_padded_ids[i].size(1) < max_size:
+                    pad_size = max_size - all_padded_ids[i].size(1)
+                    all_padded_ids[i] = torch.nn.functional.pad(all_padded_ids[i], (0, pad_size), 'constant', 0)
+            
+            for i in range(len(all_attention_masks)):
+                if all_attention_masks[i].numel() > 0 and all_attention_masks[i].size(1) < max_size:
+                    pad_size = max_size - all_attention_masks[i].size(1)
+                    all_attention_masks[i] = torch.nn.functional.pad(all_attention_masks[i], (0, pad_size), 'constant', 0)
+            
+            for i in range(len(all_response_masks)):
+                if all_response_masks[i].numel() > 0 and all_response_masks[i].size(1) < max_size:
+                    pad_size = max_size - all_response_masks[i].size(1)
+                    all_response_masks[i] = torch.nn.functional.pad(all_response_masks[i], (0, pad_size), 'constant', 0)
         
         # Now it's safe to concatenate
         if all(tensor.numel() > 0 for tensor in all_logprobs) and len(all_logprobs) > 0:
