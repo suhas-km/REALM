@@ -308,7 +308,7 @@ class CustomPPO:
         rewards = rewards.to(self.device)
         response_mask = response_mask.to(self.device)
         
-        # Get current values
+        # Get current values and logprobs on policy device
         with torch.no_grad():
             outputs = self.model(
                 input_ids=input_ids,
@@ -317,6 +317,24 @@ class CustomPPO:
                 return_dict=True
             )
             values = self._get_values(outputs.hidden_states[-1], attention_mask)
+        
+        # Get reference model logprobs WITHOUT moving model (compute on ref model's device)
+        with torch.no_grad():
+            # Get ref model's device
+            ref_device = next(self.ref_model.parameters()).device
+            logger.info(f"Computing reference logprobs on {ref_device}")
+            
+            # Copy input tensors to ref device
+            ref_input_ids = input_ids.to(ref_device)
+            ref_attention_mask = attention_mask.to(ref_device)
+            
+            # Compute logprobs on ref device
+            ref_logprobs, _ = self._get_logprobs(
+                self.ref_model, ref_input_ids, ref_attention_mask
+            )
+            
+            # Move only the resulting tensor back to policy device
+            ref_logprobs = ref_logprobs.to(self.device)
         
         # All examples are individual sequences, so done is always 1
         dones = torch.ones_like(rewards)
@@ -336,26 +354,6 @@ class CustomPPO:
                 self.model, input_ids, attention_mask
             )
             
-            # Get reference log probabilities for KL calculation
-            device_before = next(self.ref_model.parameters()).device
-            if str(device_before) != str(self.device):
-                # Move reference model temporarily to same device to avoid cross-device issues
-                self.ref_model.to(self.device)
-                # Synchronize to ensure device transfer is complete
-                torch.cuda.synchronize(self.device)
-            
-            # Get reference model logprobs
-            ref_logprobs, _ = self._get_logprobs(
-                self.ref_model,
-                input_ids,
-                attention_mask
-            )
-            
-            # Move reference model back if needed
-            if str(device_before) != str(self.device):
-                self.ref_model.to(device_before)
-                torch.cuda.synchronize(device_before)
-            
             # Calculate masked log probs
             response_mask_shifted = response_mask[:, 1:]  # Shift to match token predictions
             
@@ -367,7 +365,7 @@ class CustomPPO:
                 response_mask_shifted
             )
             
-            # Calculate KL divergence
+            # Calculate KL divergence using the pre-computed ref_logprobs
             kl = self._calculate_kl(current_logprobs, ref_logprobs, current_mask)
             
             # Get fresh values
@@ -377,10 +375,10 @@ class CustomPPO:
                 output_hidden_states=True,
                 return_dict=True
             )
-            values = self._get_values(outputs.hidden_states[-1], attention_mask)
+            current_values = self._get_values(outputs.hidden_states[-1], attention_mask)
             
             # Calculate value loss
-            value_loss = self._value_loss(values, returns, old_values)
+            value_loss = self._value_loss(current_values, returns, old_values)
             
             # Calculate entropy for regularization
             entropy = -torch.mean((torch.exp(current_logprobs) * current_logprobs) * response_mask_shifted)
