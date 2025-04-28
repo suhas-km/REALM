@@ -466,6 +466,8 @@ class HuggingFacePPOTrainer:
         # Disable distributed training completely
         self.use_distributed = False
         
+        # No mixed precision - removed per user request
+        
         # Load tokenizer and model
         model_name = config["rlhf"]["ppo"]["model_name"]
         logger.info(f"Loading model and tokenizer: {model_name}")
@@ -579,6 +581,7 @@ class HuggingFacePPOTrainer:
     def _compute_rewards(self, prompts: List[str], responses: List[str]):
         """Compute rewards for prompt-response pairs using harmonic blend"""
         # Move reward model to specified device
+        original_device = None
         if self.reward_model_device is not None:
             reward_device = f"cuda:{self.reward_model_device}"
             logger.info(f"Moving reward computation to dedicated GPU: {reward_device}")
@@ -606,18 +609,18 @@ class HuggingFacePPOTrainer:
             
             # Compute rewards for this chunk
             try:
-                with torch.amp.autocast('cuda', dtype=torch.float32, enabled=self.use_mixed_precision):
-                    chunk_rewards = []
-                    for p, r in zip(chunk_prompts, chunk_responses):
-                        try:
-                            # Get reward score using harmonic blend with the correct method name
-                            reward = self.reward_predictor.predict(p, r)
-                            chunk_rewards.append(reward)
-                        except Exception as e:
-                            logger.error(f"Error getting reward score: {e}")
-                            # Use a default score of 0 in case of error
-                            chunk_rewards.append(0.0)
-                            
+                # No mixed precision - standard computation
+                chunk_rewards = []
+                for p, r in zip(chunk_prompts, chunk_responses):
+                    try:
+                        # Get reward score using harmonic blend with the correct method name
+                        reward = self.reward_predictor.predict(p, r)
+                        chunk_rewards.append(reward)
+                    except Exception as e:
+                        logger.error(f"Error getting reward score: {e}")
+                        # Use a default score of 0 in case of error
+                        chunk_rewards.append(0.0)
+                        
                 all_rewards.extend(chunk_rewards)
                 logger.info(f"Processed reward chunk {(i//chunk_size)+1}/{(len(prompts)+chunk_size-1)//chunk_size} with mean reward: {np.mean(chunk_rewards):.4f}")
             except Exception as e:
@@ -697,33 +700,34 @@ class HuggingFacePPOTrainer:
                 chunk_response_mask = chunk_response_mask.to(self.device)
                 
                 # Run forward pass with extreme memory optimization and gradient checkpointing
-                with torch.amp.autocast('cuda', dtype=torch.float32, enabled=self.use_mixed_precision):
-                    # Make sure gradient checkpointing is enabled
-                    if not getattr(self.model, 'gradient_checkpointing', False):
-                        try:
+                # No mixed precision - standard computation
+                # Make sure gradient checkpointing is enabled
+                if not getattr(self.model, 'gradient_checkpointing', False):
+                    try:
+                        if hasattr(self.model, 'gradient_checkpointing_enable'):
                             self.model.gradient_checkpointing_enable()
                             logger.info("Enabled gradient checkpointing for model")
-                        except Exception as e:
-                            logger.warning(f"Could not enable gradient checkpointing: {e}")
-                    
-                    # Get model outputs with gradient checkpointing enabled
-                    model_outputs = self.model(
-                        input_ids=chunk_padded,
-                        attention_mask=chunk_attention_mask,
-                        output_hidden_states=True,
-                        return_dict=True
-                    )
-                    hidden_states = model_outputs.hidden_states[-1]
-                    
-                    # Compute values
-                    chunk_values = self.ppo._get_values(hidden_states, chunk_attention_mask)
-                    
-                    # Compute log probabilities
-                    chunk_logprobs, _ = self.ppo._get_logprobs(
-                        self.model, 
-                        chunk_padded, 
-                        chunk_attention_mask
-                    )
+                    except Exception as e:
+                        logger.warning(f"Could not enable gradient checkpointing: {e}")
+                
+                # Forward pass through model
+                outputs = self.model(
+                    input_ids=chunk_padded,
+                    attention_mask=chunk_attention_mask,
+                    output_hidden_states=True,
+                    return_dict=True
+                )
+                hidden_states = outputs.hidden_states[-1]
+                
+                # Compute values
+                chunk_values = self.ppo._get_values(hidden_states, chunk_attention_mask)
+                
+                # Compute log probabilities
+                chunk_logprobs, _ = self.ppo._get_logprobs(
+                    self.model, 
+                    chunk_padded, 
+                    chunk_attention_mask
+                )
                 
                 # Move results to CPU to save GPU memory
                 chunk_logprobs_cpu = chunk_logprobs.detach().cpu()
