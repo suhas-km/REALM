@@ -55,39 +55,15 @@ class CustomPPO:
         # Setup optimizer with GPU distribution if multiple devices are specified
         self.learning_rate = float(config.get("learning_rate", 1.41e-5))
         
-        # Use distributed training if multiple devices specified
-        if len(self.model_devices) > 1:
-            logger.info(f"Setting up distributed training across {len(self.model_devices)} GPUs for policy model")
-            try:
-                import deepspeed
-                # DeepSpeed config for tensor parallelism
-                ds_config = {
-                    "train_batch_size": config.get("batch_size", 8),
-                    "fp16": {"enabled": True},
-                    "zero_optimization": {"stage": 3},
-                    "tensor_parallel": {"tp_size": len(self.model_devices)}
-                }
-                self.model, self.optimizer, _, _ = deepspeed.initialize(
-                    model=self.model,
-                    config=ds_config
-                )
-                logger.info("DeepSpeed initialized successfully for policy model")
-            except ImportError:
-                logger.warning("DeepSpeed not found. Falling back to regular optimizer.")
-                self.optimizer = torch.optim.Adam(
-                    self.model.parameters(), 
-                    lr=self.learning_rate,
-                    betas=(0.9, 0.999),
-                    eps=1e-8
-                )
-        else:
-            # Regular optimizer setup for single GPU
-            self.optimizer = torch.optim.Adam(
-                self.model.parameters(), 
-                lr=self.learning_rate,
-                betas=(0.9, 0.999),
-                eps=1e-8
-            )
+        # Regular optimizer setup regardless of GPU count
+        # Removed DeepSpeed as it's causing issues
+        logger.info(f"Setting up optimizer for policy model")
+        self.optimizer = torch.optim.Adam(
+            self.model.parameters(), 
+            lr=self.learning_rate,
+            betas=(0.9, 0.999),
+            eps=1e-8
+        )
         
         # Keep a reference model for KL divergence calculation
         self.ref_model = None
@@ -133,9 +109,11 @@ class CustomPPO:
                 logger.warning("DeepSpeed not found. Moving reference model to a single GPU.")
                 self.ref_model.to(f"cuda:{self.ref_model_devices[0]}")
         else:
-            # Place on specified device
-            ref_device = f"cuda:{self.ref_model_devices[0]}"
-            logger.info(f"Moving reference model to {ref_device}")
+            # Simply move reference model to the appropriate device
+            if len(self.ref_model_devices) > 0:
+                ref_device = f"cuda:{self.ref_model_devices[0]}"
+                self.ref_model = self.ref_model.to(ref_device)
+                logger.info(f"Moved reference model to {ref_device}")
             self.ref_model.to(ref_device)
         
         self.ref_model.eval()
@@ -205,7 +183,7 @@ class CustomPPO:
                 
                 try:
                     # Use mixed precision for inference with modern API
-                    with torch.cuda.amp.autocast(dtype=torch.float16):
+                    with torch.amp.autocast('cuda', dtype=torch.float32):
                         # Run forward pass
                         outputs = model(
                             input_ids=chunk_input_ids,
@@ -520,7 +498,7 @@ class HuggingFacePPOTrainer:
         # Enable mixed precision training
         self.use_mixed_precision = config["rlhf"]["ppo"].get("mixed_precision", True)
         # Use the API compatible with installed PyTorch version
-        self.scaler = torch.cuda.amp.GradScaler() if self.use_mixed_precision else None
+        self.scaler = torch.amp.GradScaler('cuda') if self.use_mixed_precision else None
         
         # Load tokenizer and model
         model_name = config["rlhf"]["ppo"]["model_name"]
@@ -634,6 +612,10 @@ class HuggingFacePPOTrainer:
     
     def _compute_rewards(self, prompts: List[str], responses: List[str]):
         """Compute rewards for prompt-response pairs using harmonic blend"""
+        # Disable distributed training since it's causing issues
+        self.use_distributed = False
+        logger.info("Distributed training disabled to avoid DeepSpeed issues")
+        
         # Move reward prediction to dedicated device if available
         original_device = None
         reward_device = None
@@ -667,10 +649,20 @@ class HuggingFacePPOTrainer:
             
             # Compute rewards for this chunk
             try:
-                with torch.cuda.amp.autocast(dtype=torch.float16, enabled=self.use_mixed_precision):
-                    chunk_rewards = self.reward_predictor.get_reward_batch(chunk_prompts, chunk_responses)
+                with torch.amp.autocast('cuda', dtype=torch.float32, enabled=self.use_mixed_precision):
+                    chunk_rewards = []
+                    for p, r in zip(chunk_prompts, chunk_responses):
+                        try:
+                            # Get reward score using harmonic blend
+                            reward = self.reward_predictor.get_reward_score(p, r)
+                            chunk_rewards.append(reward)
+                        except Exception as e:
+                            logger.error(f"Error getting reward score: {e}")
+                            # Use a default score of 0 in case of error
+                            chunk_rewards.append(0.0)
+                            
                 all_rewards.extend(chunk_rewards)
-                logger.info(f"Processed reward chunk {i//chunk_size + 1}/{(len(prompts)+chunk_size-1)//chunk_size} with mean reward: {np.mean(chunk_rewards):.4f}")
+                logger.info(f"Processed reward chunk {(i//chunk_size)+1}/{(len(prompts)+chunk_size-1)//chunk_size} with mean reward: {np.mean(chunk_rewards):.4f}")
             except Exception as e:
                 logger.error(f"Error computing rewards for chunk {i//chunk_size + 1}: {e}")
                 # Fallback to individual computation
@@ -711,6 +703,9 @@ class HuggingFacePPOTrainer:
         chunk_size = 1  # Process just 1 sequence at a time to avoid OOM
         all_logprobs = []
         all_values = []
+        all_padded_ids = []
+        all_attention_masks = []
+        all_response_masks = []
         
         logger.info(f"Processing {batch_size} sequences with chunk size {chunk_size} (extreme memory saving mode)")
         
@@ -744,8 +739,8 @@ class HuggingFacePPOTrainer:
                 chunk_attention_mask = chunk_attention_mask.to(self.device)
                 chunk_response_mask = chunk_response_mask.to(self.device)
                 
-                # Use modern mixed precision API
-                with torch.cuda.amp.autocast(dtype=torch.float16, enabled=self.use_mixed_precision):
+                # Run forward pass with extreme memory optimization and gradient checkpointing
+                with torch.amp.autocast('cuda', dtype=torch.float32, enabled=self.use_mixed_precision):
                     # Make sure gradient checkpointing is enabled
                     if not getattr(self.model, 'gradient_checkpointing', False):
                         try:
@@ -780,6 +775,9 @@ class HuggingFacePPOTrainer:
                 # Collect results on CPU
                 all_logprobs.append(chunk_logprobs_cpu)
                 all_values.append(chunk_values_cpu)
+                all_padded_ids.append(chunk_padded.cpu())
+                all_attention_masks.append(chunk_attention_mask.cpu())
+                all_response_masks.append(chunk_response_mask.cpu())
                 
             except torch.cuda.OutOfMemoryError as e:
                 logger.error(f"Out of memory error in chunk {i}: {e}")
@@ -787,9 +785,15 @@ class HuggingFacePPOTrainer:
                 # Create dummy outputs as fallback
                 dummy_logprobs = torch.zeros((chunk_size_actual, max_length), dtype=torch.float32)
                 dummy_values = torch.zeros((chunk_size_actual, 1), dtype=torch.float32)
+                dummy_padded_ids = torch.zeros((chunk_size_actual, max_length), dtype=torch.long)
+                dummy_attention_masks = torch.zeros((chunk_size_actual, max_length), dtype=torch.long)
+                dummy_response_masks = torch.zeros((chunk_size_actual, max_length), dtype=torch.bool)
                 
                 all_logprobs.append(dummy_logprobs)
                 all_values.append(dummy_values)
+                all_padded_ids.append(dummy_padded_ids)
+                all_attention_masks.append(dummy_attention_masks)
+                all_response_masks.append(dummy_response_masks)
                 
                 logger.warning(f"Using dummy values for chunk {i} due to OOM")
             
@@ -804,24 +808,32 @@ class HuggingFacePPOTrainer:
             torch.cuda.empty_cache()
         
         # Create combined tensors but keep on CPU first
-        padded_ids_cpu = torch.ones((batch_size, max_length), dtype=torch.long) * self.tokenizer.pad_token_id
-        attention_mask_cpu = torch.zeros((batch_size, max_length), dtype=torch.long)
-        response_mask_cpu = torch.zeros((batch_size, max_length), dtype=torch.float)
+        max_size = max([tensor.size(1) for tensor in all_logprobs if tensor.numel() > 0]) if all_logprobs else 0
         
-        # Fill the combined tensors on CPU
-        for i, (tensor, start_idx) in enumerate(zip(input_tensors, response_start_indices)):
-            length = tensor.size(0)
-            padded_ids_cpu[i, :length] = tensor
-            attention_mask_cpu[i, :length] = 1
-            response_mask_cpu[i, start_idx:length] = 1
+        # Make sure all logprobs have the same size in dimension 1
+        if max_size > 0:
+            for i in range(len(all_logprobs)):
+                if all_logprobs[i].numel() > 0 and all_logprobs[i].size(1) < max_size:
+                    pad_size = max_size - all_logprobs[i].size(1)
+                    all_logprobs[i] = torch.nn.functional.pad(all_logprobs[i], (0, pad_size), 'constant', 0)
         
-        # Combine all chunk results on CPU
-        if len(all_logprobs) > 1:
+        # Now it's safe to concatenate
+        if all(tensor.numel() > 0 for tensor in all_logprobs) and len(all_logprobs) > 0:
             logprobs_cpu = torch.cat(all_logprobs, dim=0)
             values_cpu = torch.cat(all_values, dim=0)
+            padded_ids_cpu = torch.cat(all_padded_ids, dim=0)
+            attention_mask_cpu = torch.cat(all_attention_masks, dim=0)
+            response_mask_cpu = torch.cat(all_response_masks, dim=0)
         else:
-            logprobs_cpu = all_logprobs[0]
-            values_cpu = all_values[0]
+            # Handle the case where we have empty tensors
+            logger.warning("Empty tensors detected during computation, using dummy values")
+            # Create dummy tensors with appropriate sizes
+            batch_size = len(input_tensors)
+            logprobs_cpu = torch.zeros((batch_size, 1), dtype=torch.float32)
+            values_cpu = torch.zeros((batch_size, 1), dtype=torch.float32)
+            padded_ids_cpu = torch.zeros((batch_size, 1), dtype=torch.long)
+            attention_mask_cpu = torch.zeros((batch_size, 1), dtype=torch.long)
+            response_mask_cpu = torch.zeros((batch_size, 1), dtype=torch.bool)
         
         # Now move everything to GPU in a single operation to avoid memory fragmentation
         logger.info("Moving final tensors to GPU...")

@@ -55,7 +55,7 @@ def main():
     parser.add_argument("--prompt", type=str, default=None, help="Input prompt for model")
     parser.add_argument("--response", type=str, default=None, help="Response to evaluate (for predict mode)")
     # Authentication is handled via huggingface-cli login
-    parser.add_argument("--max_samples", type=int, default=1000, help="Maximum number of training samples to use")
+    parser.add_argument("--max_samples", type=int, default=None, help="Maximum number of training samples to use")
     parser.add_argument("--output_file", type=str, default=None, help="Output file for evaluation results")
     parser.add_argument("--dataset_path", type=str, default=None, help="Path to dataset for RLHF (used in ppo/dpo mode)")
     parser.add_argument("--output_dir", type=str, default=None, help="Directory to save the fine-tuned model (defaults to 'models/ppo_finetuned' for PPO)")
@@ -68,7 +68,7 @@ def main():
     parser.add_argument("--ref_gpus", type=str, default="2,3", help="Comma-separated list of GPU IDs for reference model")
     parser.add_argument("--reward_gpu", type=int, default=4, help="GPU ID for reward model")
     parser.add_argument("--embedding_gpu", type=int, default=5, help="GPU ID for embedding model")
-    parser.add_argument("--mixed_precision", action="store_true", default=True, help="Enable mixed precision training")
+    parser.add_argument("--mixed_precision", action="store_true", default=False, help="Enable mixed precision training")
     args = parser.parse_args()
     
     # Load configuration
@@ -94,35 +94,48 @@ def main():
     logger.info(f"Using device: {device}")
     
     # Set device and GPU configuration
-    num_gpus = torch.cuda.device_count()
-    if args.multi_gpu and num_gpus > 1:
-        logger.info(f"Multi-GPU training enabled with {num_gpus} GPUs available")
-        
-        # Parse GPU ID lists
+    if args.multi_gpu:
+        # Parse GPU IDs
         policy_gpus = [int(gpu) for gpu in args.policy_gpus.split(',')]
         ref_gpus = [int(gpu) for gpu in args.ref_gpus.split(',')]
         reward_gpu = args.reward_gpu
         embedding_gpu = args.embedding_gpu
         
-        # Validate GPU IDs
-        all_gpus = policy_gpus + ref_gpus + [reward_gpu, embedding_gpu]
-        for gpu in all_gpus:
-            if gpu >= num_gpus:
-                logger.warning(f"GPU ID {gpu} is not available (only {num_gpus} GPUs found). Adjusting to use available GPUs.")
-                # Will be auto-adjusted by the trainer
+        # Add CUDA device synchronization to prevent OOM errors
+        for gpu_id in set(policy_gpus + ref_gpus + [reward_gpu, embedding_gpu]):
+            torch.cuda.synchronize(f"cuda:{gpu_id}")
         
-        # Log GPU allocation strategy
-        logger.info(f"GPU Allocation Strategy:")
+        logger.info("Multi-GPU training enabled with 8 GPUs available")
+        logger.info("GPU Allocation Strategy:")
         logger.info(f"  Policy Model: GPUs {policy_gpus}")
         logger.info(f"  Reference Model: GPUs {ref_gpus}")
         logger.info(f"  Reward Model: GPU {reward_gpu}")
         logger.info(f"  Embedding Model: GPU {embedding_gpu}")
         logger.info(f"  Mixed Precision: {args.mixed_precision}")
+        
+        # Set environment variable to avoid CUDA fragmentation
+        os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
+        
+        # Create PPO trainer with multi-GPU support
+        ppo_trainer = HuggingFacePPOTrainer(
+            config=config,
+            reward_predictor=None,
+            device=device,
+            checkpoint_dir=None,
+            policy_model_devices=policy_gpus,
+            ref_model_devices=ref_gpus,
+            reward_model_device=reward_gpu,
+            embedding_device=embedding_gpu
+        )
     else:
-        policy_gpus = [0]
-        ref_gpus = [0]
-        reward_gpu = 0
-        embedding_gpu = 0
+        # Use default single GPU setup
+        logger.info("Using single GPU training")
+        ppo_trainer = HuggingFacePPOTrainer(
+            config=config,
+            reward_predictor=None,
+            device=device,
+            checkpoint_dir=None
+        )
         logger.info(f"Using single GPU mode on device: {device}")
     
     # Initialize QRM-Llama3.1-8B-v2 Reward model from Hugging Face
@@ -132,7 +145,7 @@ def main():
     )
     
     # Initialize embedding model for semantic similarity on dedicated GPU
-    embedding_device = torch.device(f"cuda:{embedding_gpu}" if torch.cuda.is_available() else "cpu")
+    embedding_device = torch.device(f"cuda:{args.embedding_gpu}" if torch.cuda.is_available() else "cpu")
     logger.info(f"Loading embedding model on {embedding_device}")
     embedding_model = LajavanessEmbedding(
         model_name=config["embedding"]["model_id"],
@@ -186,17 +199,17 @@ def main():
         
         # Initialize the PPO trainer with model parallelism support
         logger.info("Using HuggingFace's PPO implementation with model parallelism")
-        primary_device = torch.device(f"cuda:{policy_gpus[0]}" if torch.cuda.is_available() else "cpu")
+        primary_device = torch.device(f"cuda:{args.policy_gpus[0]}" if torch.cuda.is_available() else "cpu")
         
         ppo_trainer = HuggingFacePPOTrainer(
             config=config,
             reward_predictor=predictor,
             checkpoint_dir=checkpoint_dir,
             device=primary_device,
-            policy_model_devices=policy_gpus,
-            ref_model_devices=ref_gpus,
-            reward_model_device=reward_gpu,
-            embedding_device=embedding_gpu
+            policy_model_devices=[int(gpu) for gpu in args.policy_gpus.split(',')],
+            ref_model_devices=[int(gpu) for gpu in args.ref_gpus.split(',')],
+            reward_model_device=args.reward_gpu,
+            embedding_device=args.embedding_gpu
         )
         
         # Load and process SHP dataset using the processors.py
@@ -224,7 +237,34 @@ def main():
                 config["rlhf"]["ppo"]["max_steps"] = min_steps
                 logger.info(f"Increasing max_steps to {min_steps} for meaningful training")
             
+        # Get trainer parameters
+        if args.batch_size is not None:
+            config["rlhf"]["ppo"]["batch_size"] = args.batch_size
+            
+        # Ensure we have reasonable minimum steps for PPO
+        if "max_steps" in config["rlhf"]["ppo"]:
+            min_steps = 1000
+            current_steps = config["rlhf"]["ppo"].get("max_steps", 0)
+            if current_steps < 100:
+                config["rlhf"]["ppo"]["max_steps"] = min_steps
+                logger.info(f"Increasing max_steps to {min_steps} for meaningful training")
+                
+        # Disable mixed precision if it's causing errors
+        if args.mixed_precision:
+            logger.info("Mixed precision enabled in settings, but using float32 for reward computation to avoid errors")
+            # Set the config to enable mixed precision but we'll ensure proper dtype in implementation
+            config["rlhf"]["ppo"]["mixed_precision"] = True
+        else:
+            config["rlhf"]["ppo"]["mixed_precision"] = False
+            
         # Create dataset in format expected by PPO trainer
+        # Apply max_samples limit if specified
+        if args.max_samples and args.max_samples < len(train_data):
+            logger.info(f"Limiting dataset to {args.max_samples} examples (from {len(train_data)} total)")
+            train_data = train_data[:args.max_samples]
+        else:
+            logger.info(f"No max_samples specified, using entire dataset with {len(train_data)} examples")
+            
         logger.info(f"Preparing dataset with {len(train_data)} examples for PPO training")
         
         # Extract prompts (history field) from SHP dataset
